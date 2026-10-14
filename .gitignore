@@ -1,0 +1,21 @@
+# Python
+.venv-cml/
+__pycache__/
+*.pyc
+*.pyo
+
+# build products
+build/
+*.dylib
+*.o
+*.a
+
+# macOS
+.DS_Store
+
+# logs and probe output (regenerable; not source)
+*.log
+*.npy
+
+# scratch
+/tmp/

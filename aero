@@ -1,0 +1,10 @@
+#!/bin/sh
+# aero -- wrapper for the device-count CLI.
+# Keeps the venv path in one place so the flags are usable directly.
+set -e
+HERE=$(cd "$(dirname "$0")" && pwd)
+PY="$HERE/.venv-cml/bin/python"
+if [ ! -x "$PY" ]; then
+  PY=$(command -v python3) || { echo "no python3 found" >&2; exit 1; }
+fi
+exec "$PY" "$HERE/engine/cli.py" "$@"

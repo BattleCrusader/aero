@@ -1,0 +1,10 @@
+#!/bin/sh
+# aero-serve -- OpenAI-compatible API server.
+# Run as a MODULE (-m) so the engine package's relative imports resolve.
+# Running the file directly (python engine/server.py) breaks them.
+set -e
+HERE=$(cd "$(dirname "$0")" && pwd)
+PY="$HERE/.venv-cml/bin/python"
+[ -x "$PY" ] || PY=$(command -v python3)
+cd "$HERE"
+exec "$PY" -m engine.server "$@"
