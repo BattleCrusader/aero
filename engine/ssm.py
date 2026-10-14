@@ -46,6 +46,19 @@ import numpy as np
 
 from .transformer import linear, rms_norm, silu
 
+try:                                    # native inner loops (src/ssm.cpp)
+    from . import native_ssm as _native_ssm
+except ImportError:                     # pragma: no cover - lib not built
+    _native_ssm = None
+
+
+def _native_mod():
+    """The native SSM kernels, or None when the library is not built."""
+    if _native_ssm is not None and _native_ssm.available():
+        return _native_ssm
+    return None
+
+
 
 def softplus(x: np.ndarray) -> np.ndarray:
     """log(1 + e^x), stable for large |x|."""
@@ -194,6 +207,16 @@ def delta_rule_step(q, k, v, alpha, beta, a_log, dt_bias, state, scale, eps=1e-6
     state: (n_v_heads, d, d)
     Returns (out (n_v_heads, d), new_state)
     """
+    # Native path: the same recurrence in C++. Falls through to numpy if the
+    # library is not built, so a source checkout without `make all` still runs.
+    nm = _native_mod()
+    if nm is not None:
+        try:
+            return nm.delta_step(q, k, v, alpha, beta, a_log, dt_bias,
+                                 state, scale, eps)
+        except nm.SsmUnavailable:
+            pass
+
     # ASSUMPTION 1: L2-normalise q and k per head
     qn = l2_normalize(q.astype(np.float32), axis=-1, eps=eps)
     kn = l2_normalize(k.astype(np.float32), axis=-1, eps=eps)
@@ -221,6 +244,44 @@ def delta_rule_step(q, k, v, alpha, beta, a_log, dt_bias, state, scale, eps=1e-6
     return out, state
 
 
+def _ssm_forward_native(nm, x, w, cfg, state, gdn_state):
+    """Native full-layer forward. Returns (out, new_gdn_state), or None to fall
+    back to numpy when the dimension combination is one the C++ refuses.
+
+    `state.conv.tail` carries the conv history across calls exactly as the numpy
+    ConvState does; gdn_state is stepped on a copy so the caller's array is not
+    mutated (the numpy path returns a fresh state too).
+    """
+    nv, d = cfg.n_v_heads, cfg.state_size
+    if cfg.time_step_rank != nv or cfg.inner_size != nv * d:
+        return None
+    if state is None:
+        state = SsmState.create(cfg)
+    if gdn_state is None:
+        gdn_state = state.zeros()
+    gdn_state = np.asarray(gdn_state, dtype=np.float32)
+    if gdn_state.shape != (nv, d, d):
+        return None
+
+    keep = max(cfg.conv_kernel - 1, 0)
+    tailbuf = np.zeros((keep, cfg.qkv_width), dtype=np.float32)
+    tl = int(state.conv.tail.shape[0])
+    if tl > 0:
+        tailbuf[:tl] = state.conv.tail
+    st = np.ascontiguousarray(gdn_state).copy()
+
+    res = nm.forward(
+        np.ascontiguousarray(x, dtype=np.float32),
+        w.qkv, w.gate, w.alpha, w.beta, w.a_log, w.dt_bias, w.conv1d, w.norm,
+        w.out, cfg.n_embd, cfg.inner_size, cfg.state_size, cfg.n_group,
+        cfg.conv_kernel, cfg.time_step_rank, cfg.eps, cfg.norm_eps, tailbuf, tl, st)
+    if res is None:
+        return None
+    out, new_tl = res
+    state.conv.tail = tailbuf[:new_tl].copy()
+    return out, st
+
+
 def ssm_forward(x: np.ndarray, w: SsmWeights, cfg: SsmConfig,
                 state: Optional[SsmState] = None,
                 gdn_state: Optional[np.ndarray] = None
@@ -230,6 +291,15 @@ def ssm_forward(x: np.ndarray, w: SsmWeights, cfg: SsmConfig,
     x: (T, n_embd). Returns (out (T, n_embd), new_gdn_state).
     `gdn_state` is (n_v_heads, state_size, state_size); one per layer.
     """
+    nm = _native_mod()
+    if nm is not None:
+        try:
+            r = _ssm_forward_native(nm, x, w, cfg, state, gdn_state)
+            if r is not None:
+                return r
+        except nm.SsmUnavailable:
+            pass
+
     T = x.shape[0]
     if state is None:
         state = SsmState.create(cfg)

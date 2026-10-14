@@ -221,7 +221,7 @@ test-model: check-py
 		$(PY) -W error::RuntimeWarning tests/test_tensor_native.py 2>&1 | tail -10; echo; \
 		$(PY) -W error::RuntimeWarning tests/test_dequant_threads.py 2>&1 | tail -8; echo; \
 		$(PY) -W error::RuntimeWarning tests/test_native.py 2>&1 | tail -25; echo; \
-		$(PY) tests/test_transformer_native.py 2>&1 | tail -40; echo; \
+		$(PY) tests/test_transformer_native.py 2>&1 | tail -60; echo; \
 		AERO_SKIP_SLOW=1 $(PY) -W error::RuntimeWarning tests/test_coherence.py 2>&1 | tail -20; \
 		$(PY) tests/test_arch.py 2>&1 | tail -30; echo; \
 		AERO_SKIP_SLOW=1 $(PY) tests/test_runtime_gguf.py 2>&1 | tail -20; \

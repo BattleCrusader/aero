@@ -30,6 +30,18 @@ import numpy as np
 
 from .transformer import silu
 
+try:                                    # native inner loops (src/moe.cpp)
+    from . import native_ssm as _native_ssm
+except ImportError:                     # pragma: no cover - lib not built
+    _native_ssm = None
+
+
+def _native_mod():
+    """The native MoE kernels, or None when the library is not built."""
+    if _native_ssm is not None and _native_ssm.available():
+        return _native_ssm
+    return None
+
 
 @dataclass
 class MoeConfig:
@@ -57,6 +69,14 @@ def route(logits: np.ndarray, cfg: MoeConfig) -> Tuple[np.ndarray, np.ndarray]:
     if k <= 0 or k > cfg.n_expert:
         raise ValueError(f"n_expert_used={k} out of range for {cfg.n_expert} experts")
 
+    # Native path: the same top-k + softmax in C++.
+    nm = _native_mod()
+    if nm is not None:
+        try:
+            return nm.route(logits, cfg.n_expert, k, cfg.norm_topk_prob)
+        except nm.SsmUnavailable:
+            pass
+
     # top-k by logit; ties resolved by lowest index for determinism
     idx = np.argpartition(-logits, k - 1)[:k]
     idx = idx[np.argsort(-logits[idx], kind="stable")]
@@ -72,6 +92,26 @@ def route(logits: np.ndarray, cfg: MoeConfig) -> Tuple[np.ndarray, np.ndarray]:
         denom = float(np.exp(logits - m).sum(dtype=np.float64))
         w = np.exp(sel - m) / denom
     return idx.astype(np.int64), w.astype(np.float32)
+
+
+def _moe_ffn_native(nm, h, cfg, expert_rows, shexp, block_rows, router_fn):
+    """Native MoE FFN block. Raises on a bad router width (same contract as the
+    numpy loop); the caller falls back only on SsmUnavailable."""
+    h = np.ascontiguousarray(h, dtype=np.float32)
+    T = h.shape[0]
+    # The router consumes the ROUTER's logits, which are n_expert wide -- a
+    # separate projection from the hidden state. Compute them per token here.
+    router_logits = np.empty((T, cfg.n_expert), dtype=np.float32)
+    for t in range(T):
+        rl = np.asarray(router_fn(h[t]), dtype=np.float32).reshape(-1)
+        if rl.shape[-1] != cfg.n_expert:
+            raise ValueError(
+                f"router produced {rl.shape[-1]} logits for {cfg.n_expert} experts")
+        router_logits[t] = rl
+    use_shared = bool(cfg.has_shared and shexp)
+    return nm.ffn_block(h, router_logits, cfg.n_expert, cfg.n_expert_used,
+                        cfg.ffn_len, cfg.norm_topk_prob,
+                        shexp if use_shared else None, expert_rows, block_rows)
 
 
 def moe_ffn(h: np.ndarray, cfg: MoeConfig, expert_rows,
@@ -92,6 +132,19 @@ def moe_ffn(h: np.ndarray, cfg: MoeConfig, expert_rows,
         raise ValueError(
             "moe_ffn requires router_fn (a callable mapping a hidden vector to "
             "n_expert router logits); routing on the hidden state would be wrong")
+
+    # Native path: routing + silu(gate)*up + the weighted expert accumulation
+    # all run in C++ (src/moe.cpp). The expert-row reader still lives in Python
+    # (it is I/O), and is handed to the block as a fetch callback.
+    nm = _native_mod()
+    if nm is not None:
+        try:
+            r = _moe_ffn_native(nm, h, cfg, expert_rows, shexp, block_rows, router_fn)
+            if r is not None:
+                return r
+        except nm.SsmUnavailable:
+            pass
+
     out = np.zeros((T, cfg.n_embd), dtype=np.float32)
 
     for t in range(T):
