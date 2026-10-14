@@ -76,9 +76,21 @@ class Tokenizer:
     def __init__(self, tokens: Sequence[str], merges: Sequence[str],
                  token_types: Optional[Sequence[int]] = None,
                  eos_id: Optional[int] = None, bos_id: Optional[int] = None,
-                 pad_id: Optional[int] = None) -> None:
+                 pad_id: Optional[int] = None,
+                 vocab_type: str = "gpt2",
+                 add_space_prefix: bool = False) -> None:
         if not tokens:
             raise ValueError("empty vocabulary")
+        # TWO VOCAB FAMILIES. "gpt2" is byte-level BPE: bytes are remapped to
+        # printable codepoints and a regex defines the pre-tokenisation units.
+        # "spm" is sentencepiece-style: text stays UTF-8, a space is written as
+        # '\u2581', and merges apply to that directly. They are not
+        # interchangeable -- feeding qwen's tokens through the spm path (or vice
+        # versa) produces ids from the wrong vocabulary entirely.
+        if vocab_type not in ("gpt2", "spm"):
+            raise ValueError(f"unknown vocab_type {vocab_type!r}")
+        self.vocab_type = vocab_type
+        self.add_space_prefix = bool(add_space_prefix)
         self.tokens = list(tokens)
         self.n_vocab = len(self.tokens)
         self.token_types = list(token_types) if token_types else None
@@ -168,6 +180,24 @@ class Tokenizer:
 
     def _encode_plain(self, text: str) -> List[int]:
         out: List[int] = []
+        if self.vocab_type == "spm":
+            # sentencepiece: spaces become '\u2581', no byte remapping, and the
+            # whole string is one BPE unit (the merges already encode word
+            # boundaries via the '\u2581' convention).
+            s = text.replace(" ", "\u2581")
+            if self.add_space_prefix:
+                s = "\u2581" + s
+            for piece in self._bpe(s):
+                tid = self.encoder.get(piece)
+                if tid is None:
+                    for ch in piece:            # never silently drop input
+                        t2 = self.encoder.get(ch)
+                        if t2 is not None:
+                            out.append(t2)
+                else:
+                    out.append(tid)
+            return out
+
         for unit in _PAT.findall(text):
             mapped = "".join(_B2U[b] for b in unit.encode("utf-8"))
             for piece in self._bpe(mapped):
@@ -197,6 +227,8 @@ class Tokenizer:
                 raise IndexError(f"token id {i} out of range (vocab {self.n_vocab})")
             buf.append(self.tokens[i])
         s = "".join(buf)
+        if self.vocab_type == "spm":
+            return s.replace("\u2581", " ")
         data = bytearray()
         for ch in s:
             b = _U2B.get(ch)
@@ -218,10 +250,18 @@ class Tokenizer:
                 f"GGUF has no tokenizer ({missing} absent); this file was "
                 f"converted without one and cannot produce text")
         model = kv.get("tokenizer.ggml.model")
-        if model != "gpt2":
+        # gpt2 = byte-level BPE; llama/gemma*/spm = sentencepiece-style. Anything
+        # else is refused rather than guessed at, because a wrong vocabulary
+        # produces fluent-looking output from the wrong ids.
+        if model in ("gpt2", "qwen2"):
+            vtype = "gpt2"
+        elif model in ("llama", "spm", "gemma", "gemma2", "gemma3", "gemma4",
+                       "t5", "umt5"):
+            vtype = "spm"
+        else:
             raise ValueError(
-                f"unsupported tokenizer model {model!r}; only 'gpt2' byte-level "
-                f"BPE is implemented")
+                f"unsupported tokenizer model {model!r}; supported: gpt2 "
+                f"(byte-level BPE) and llama/spm/gemma* (sentencepiece)")
         return cls(
             tokens=kv["tokenizer.ggml.tokens"],
             merges=kv["tokenizer.ggml.merges"],
@@ -229,4 +269,6 @@ class Tokenizer:
             eos_id=kv.get("tokenizer.ggml.eos_token_id"),
             bos_id=kv.get("tokenizer.ggml.bos_token_id"),
             pad_id=kv.get("tokenizer.ggml.padding_token_id"),
+            vocab_type=vtype,
+            add_space_prefix=bool(kv.get("tokenizer.ggml.add_space_prefix", False)),
         )

@@ -87,6 +87,34 @@ def softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
     return e / np.sum(e, axis=axis, keepdims=True)
 
 
+def _erf(x: np.ndarray) -> np.ndarray:
+    """Vectorised erf, Abramowitz & Stegun 7.1.26 (|error| < 1.5e-7).
+
+    numpy has no erf and `math.erf` is scalar-only, so this fills the gap rather
+    than pulling in scipy. 1.5e-7 is far below fp32 resolution, so it is exact for
+    our purposes.
+    """
+    xf = x.astype(np.float32, copy=False)
+    sign = np.sign(xf)
+    a1, a2, a3, a4, a5 = (0.254829592, -0.284496736, 1.421413741,
+                          -1.453152027, 1.061405429)
+    p = 0.3275911
+    ax = np.abs(xf)
+    t = 1.0 / (1.0 + p * ax)
+    poly = (((((a5 * t + a4) * t) + a3) * t + a2) * t + a1) * t
+    return (sign * (1.0 - poly * np.exp(-ax * ax))).astype(np.float32)
+
+
+def gelu(x: np.ndarray) -> np.ndarray:
+    """Gemma4's FFN activation: gelu(gate) * up, NOT swiglu.
+
+    Exact (erf) form. The tanh approximation is off by ~1e-3, which compounds
+    across 48 layers and drifts the logits.
+    """
+    return (0.5 * x.astype(np.float32, copy=False)
+            * (1.0 + _erf(x * 0.7071067811865476))).astype(np.float32)
+
+
 def silu(x: np.ndarray) -> np.ndarray:
     return x / (1.0 + np.exp(-x))
 
@@ -105,17 +133,32 @@ def linear(x: np.ndarray, w: np.ndarray, b: Optional[np.ndarray] = None) -> np.n
 
 
 def rope_tables(head_dim: int, positions: np.ndarray, base: float,
-                n_dims: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray]:
+                n_dims: Optional[int] = None,
+                freq_factors: Optional[np.ndarray] = None) -> Tuple[np.ndarray, np.ndarray]:
     """cos/sin tables for RoPE. `n_dims` allows PARTIAL rotary: only the first
     n_dims channels are rotated, the rest pass through.
 
     Returns (cos, sin) each of shape (len(positions), n_rot) where n_rot is
     n_dims (rounded to even).
+
+    PROPORTIONAL RoPE (ggml's `freq_factors`). The factor DIVIDES the per-pair
+    angle: ggml_rope_cache_init computes `theta/ff` where theta is
+    pos * base^(-2p/n_dims) for pair p. A factor of 1 changes nothing; a huge
+    factor drives the angle to 0, i.e. cos=1/sin=0, leaving that pair UNROTATED.
+    That is exactly how gemma4 encodes "these full-attention layers rotate only
+    the first 128 of their 512 channels": rope_freqs is 1.0 for the first 64
+    pairs and 1e30 for the remaining 192.
     """
     n = head_dim if n_dims is None else min(n_dims, head_dim)
     n = n - (n % 2)
     half = n // 2
     inv = 1.0 / (base ** (np.arange(0, half, dtype=np.float32) * 2.0 / n))
+    if freq_factors is not None:
+        ff = np.asarray(freq_factors, dtype=np.float32).reshape(-1)
+        if ff.size < half:
+            raise ValueError(
+                f"freq_factors has {ff.size} entries, need {half} for n_dims {n}")
+        inv = inv / ff[:half]
     ang = positions.astype(np.float32)[:, None] * inv[None, :]      # (T, half)
     return np.cos(ang), np.sin(ang)
 
@@ -171,6 +214,9 @@ class AttnWeights:
     bq: Optional[np.ndarray] = None
     bk: Optional[np.ndarray] = None
     bv: Optional[np.ndarray] = None
+    # gemma4: the value vector is RMS-normalised with NO learned weight. A
+    # learned norm here would apply 3840 random multipliers and destroy attention.
+    v_norm_weightless: bool = False
 
 
 @dataclass
@@ -183,6 +229,9 @@ class AttnConfig:
     rope_dims: Optional[int] = None      # partial rotary
     eps: float = 1e-6
     scale: Optional[float] = None        # default 1/sqrt(head_dim)
+    # PROPORTIONAL RoPE. ggml divides each pair's angle by freq_factors[p]; None
+    # means plain RoPE. gemma4 sets this on its full-attention layers only.
+    freq_factors: Optional[np.ndarray] = None
 
 
 class KVCache:
@@ -221,7 +270,9 @@ class KVCache:
                  k_dtype: Optional[str] = None,
                  v_dtype: Optional[str] = None,
                  heads_per_layer: Optional[dict] = None,
-                 rope_k: bool = False) -> None:
+                 rope_k: bool = False,
+                 head_dims: Optional[dict] = None,
+                 value_dims: Optional[dict] = None) -> None:
         """`layer_indices` = the layers that actually attend.
 
         This matters more than it looks. A hybrid model like qwen35 has 33 layers
@@ -283,6 +334,16 @@ class KVCache:
         self.rope_k = bool(rope_k)
         self.heads = {li: int((heads_per_layer or {}).get(li, n_head_kv))
                       for li in self.layer_indices}
+        # PER-LAYER VECTOR WIDTHS. gemma4's windowed layers use a narrower head
+        # than its global ones (256 vs 512), so a single width for the whole cache
+        # would mis-size -- and silently mis-read -- most of its layers.
+        self.kdim = {li: int((head_dims or {}).get(li, head_dim))
+                     for li in self.layer_indices}
+        self.vdim = {li: int((value_dims or {}).get(li, value_dim))
+                     for li in self.layer_indices}
+        if any(d <= 0 for d in self.kdim.values()) or \
+           any(d <= 0 for d in self.vdim.values()):
+            raise ValueError(f"every layer needs positive dims; got {self.kdim}")
         if any(h <= 0 for h in self.heads.values()):
             raise ValueError(f"every layer needs >=1 KV head; got {self.heads}")
         self.windowed = dict(windowed or {})
@@ -298,32 +359,34 @@ class KVCache:
         self.value_dim = value_dim
         self.dtype = dtype
 
-        self.k, self.k_scale = self._alloc_side(self.k_dtype, head_dim)
-        self.v, self.v_scale = self._alloc_side(self.v_dtype, value_dim)
+        self.k, self.k_scale = self._alloc_side(self.k_dtype, self.kdim)
+        self.v, self.v_scale = self._alloc_side(self.v_dtype, self.vdim)
 
         self.len = 0
         self.appends = 0
         self._quant_err = 0.0
 
-    def _alloc_side(self, dt: str, dim: int):
-        """Allocate one side (K or V), per layer, at that layer's head count."""
+    def _alloc_side(self, dt: str, dims: dict):
+        """Allocate one side (K or V), per layer, at that layer's head count and
+        width."""
         hh = [self.heads[li] for li in self.layer_indices]
+        dd = [dims[li] for li in self.layer_indices]
         if dt == "int4":
             # NIBBLE-PACKED: two 4-bit values per byte. This is what actually
             # halves the bytes; quantising to a 4-bit RANGE inside an int8 array
             # would save nothing. Measured: 262144 ctx -> 2.32 GiB vs int8 4.57.
-            arr = [np.zeros((c, h, dim // 2), dtype=np.uint8)
-                   for c, h in zip(self.caps, hh)]
+            arr = [np.zeros((c, h, d // 2), dtype=np.uint8)
+                   for c, h, d in zip(self.caps, hh, dd)]
             sc = [np.zeros((c, h), dtype=np.float32)
                   for c, h in zip(self.caps, hh)]
         elif dt == "int8":
-            arr = [np.zeros((c, h, dim), dtype=np.int8)
-                   for c, h in zip(self.caps, hh)]
+            arr = [np.zeros((c, h, d), dtype=np.int8)
+                   for c, h, d in zip(self.caps, hh, dd)]
             sc = [np.zeros((c, h), dtype=np.float32)
                   for c, h in zip(self.caps, hh)]
         else:
-            arr = [np.zeros((c, h, dim), dtype=np.float32)
-                   for c, h in zip(self.caps, hh)]
+            arr = [np.zeros((c, h, d), dtype=np.float32)
+                   for c, h, d in zip(self.caps, hh, dd)]
             sc = None
         return arr, sc
 
@@ -410,10 +473,11 @@ class KVCache:
             # wrapped: rotate so index 0 is the OLDEST retained position
             start = end % cap
             idx = np.concatenate([np.arange(start, cap), np.arange(0, start)])
+        li = self.layer_indices[slot]
         k = self._read_side(self.k_dtype, self.k, self.k_scale,
-                            slot, idx, self.head_dim)
+                            slot, idx, self.kdim[li])
         v = self._read_side(self.v_dtype, self.v, self.v_scale,
-                            slot, idx, self.value_dim)
+                            slot, idx, self.vdim[li])
         return k, v
 
     def _read(self, layer: int, end: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -500,8 +564,8 @@ class KVCache:
         the old (wrong) behaviour, so the comparison is honest about what was
         saved."""
         per = max(self.heads.values()) if self.heads else self.n_head_kv
-        return (len(self.k) * self.capacity * per *
-                (self.head_dim + self.value_dim) * 4)
+        widest = max(self.kdim[li] + self.vdim[li] for li in self.layer_indices)
+        return len(self.k) * self.capacity * per * widest * 4
 
     @property
     def n_layers_cached(self) -> int:
@@ -628,15 +692,26 @@ def attention(x: np.ndarray, pos: np.ndarray, w: AttnWeights, cfg: AttnConfig,
             f"attn_q emits {q_raw.shape[-1]} values; expected {H * D} or {2 * H * D}")
 
     q = q_raw.reshape(T, H, D)
-    k = linear(x, w.wk).reshape(T, HK, D)
-    v = linear(x, w.wv).reshape(T, HK, DV)
+    k_raw = linear(x, w.wk).reshape(T, HK, D)
+    # gemma4's global layers carry NO attn_v: V IS the raw K projection. Taking
+    # the normed or rotated K instead would silently change every value.
+    v_raw = (linear(x, w.wv).reshape(T, HK, DV)
+             if w.wv is not None else k_raw)
 
     if w.q_norm is not None:
         q = rms_norm(q, w.q_norm, cfg.eps)
-    if w.k_norm is not None:
-        k = rms_norm(k, w.k_norm, cfg.eps)
+    k = rms_norm(k_raw, w.k_norm, cfg.eps) if w.k_norm is not None else k_raw
+    if w.v_norm_weightless:
+        # weightless RMS: normalise, no learned scale
+        v = rms_norm(v_raw, np.ones(DV, dtype=np.float32), cfg.eps)
+    else:
+        v = v_raw
 
-    cos, sin = rope_tables(D, pos, cfg.rope_base, cfg.rope_dims)
+    # cfg.rope_base / cfg.rope_dims are set PER LAYER by the caller, because
+    # gemma4 rotates its windowed and global layers differently. cfg.freq_factors
+    # is likewise per layer: only the full-attention layers carry rope_freqs.
+    cos, sin = rope_tables(D, pos, cfg.rope_base, cfg.rope_dims,
+                           freq_factors=cfg.freq_factors)
     q = apply_rope(q, cos, sin)
 
     # PRE-ROPE K: when the cache stores raw K, rotation moves to READ time (the
@@ -670,7 +745,8 @@ def attention(x: np.ndarray, pos: np.ndarray, w: AttnWeights, cfg: AttnConfig,
         # tests/test_prerope.py [4].
         base = int(pos[0]) - (cache.len if cache is not None else 0)
         kpos = np.arange(base, base + k_all.shape[0], dtype=np.int64)
-        c2, s2 = rope_tables(D, kpos, cfg.rope_base, cfg.rope_dims)
+        c2, s2 = rope_tables(D, kpos, cfg.rope_base, cfg.rope_dims,
+                             freq_factors=cfg.freq_factors)
         k_all = apply_rope(k_all, c2, s2)
 
     out = attention_tiled(q, k_all, v_all, scale, pos, kpos=kpos,

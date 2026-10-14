@@ -12,6 +12,8 @@ the remaining work; see `GgufRuntime` for the contract it must satisfy.
 
 from __future__ import annotations
 
+import os
+
 import itertools
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -244,24 +246,30 @@ class GgufRuntime(ModelRuntime):
 
     # ---- tokenization ---------------------------------------------------
     def apply_chat_template(self, messages: List[Dict[str, str]]) -> str:
-        """ChatML framing, which is what this file's own template uses.
+        """ChatML framing, matching the file's own Jinja template.
 
-        The GGUF ships a full Jinja chat_template; rendering it would need a
-        Jinja engine, so the structural part is implemented directly and the
-        special tokens are taken from the vocab rather than hard-coded.
+        The GGUF ships a full Jinja chat_template; rendering it needs a Jinja
+        engine, so the structural part is implemented directly, using the file's
+        special tokens rather than hard-coded strings.
+
+        The important detail: after '<|im_start|>assistant\\n' this model expects a
+        THINKING BLOCK (' thinking\\n' for thinking-enabled, or
+        ' thinking\\n\\n</think>\\n\\n' for disabled). Omitting it makes the model
+        emit newline-only continuations, which looks like a broken engine.
         """
         t = self.tokenizer
-        def tok(name, fallback):
-            if t is not None and name in t._special:
-                return name
-            return fallback
-        im_start = tok("<|im_start|>", "\n")
-        im_end = tok("<|im_end|>", "\n")
+        im_start = "<|im_start|>" if (t and "<|im_start|>" in t._special) else ""
+        im_end = "<|im_end|>" if (t and "<|im_end|>" in t._special) else ""
         out = []
         for m in messages:
             role = m.get("role", "user")
             out.append(f"{im_start}{role}\n{m.get('content','')}{im_end}\n")
+        # generation prompt: assistant turn + thinking block
         out.append(f"{im_start}assistant\n")
+        if os.environ.get("AERO_THINKING", "1") == "0":
+            out.append(" thinking\n\n</think>\n\n")
+        else:
+            out.append(" thinking\n")
         return "".join(out)
 
     def tokenize(self, text: str) -> List[int]:

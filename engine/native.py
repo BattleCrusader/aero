@@ -24,10 +24,11 @@ DTYPE_F32 = 0
 DTYPE_F16 = 1
 DTYPE_Q4_K = 12
 DTYPE_Q6_K = 14
+DTYPE_IQ4_XS = 23
 DTYPE_BF16 = 30
 
 # types the native path can compute; anything else must fall back
-NATIVE_TYPES = frozenset({DTYPE_Q4_K, DTYPE_Q6_K})
+NATIVE_TYPES = frozenset({DTYPE_Q4_K, DTYPE_Q6_K, DTYPE_IQ4_XS})
 
 _LIB_CANDIDATES = (
     os.path.join(_ROOT, "build", "libaero_kernels.dylib"),
@@ -199,3 +200,72 @@ def matmul(dtype: int, w_bytes, X, threads: int = 1):
             f"native matmul refused dtype={dtype} T={T} n_rows={n_rows} "
             f"n_cols={n_cols}")
     return Y
+
+
+# --------------------------------------------------------------- memory guard
+# Binding for aero::MemoryGuard, the C++ process-wide ceiling. Enforcement is a
+# monitor thread inside the library that hard-exits on breach, so the ceiling
+# cannot be bypassed from Python.
+_GLIB_CANDIDATES = (
+    os.path.join(_ROOT, "build", "libaero_guard.dylib"),
+    os.path.join(_ROOT, "build", "libaero_guard.so"),
+)
+
+
+class MemoryGuard:
+    """Process-wide memory ceiling, backed by the C++ guard."""
+
+    _inst = None
+
+    def __init__(self, lib) -> None:
+        self._lib = lib
+
+    @classmethod
+    def instance(cls) -> "MemoryGuard":
+        if cls._inst is not None:
+            return cls._inst
+        for path in _GLIB_CANDIDATES:
+            if not os.path.exists(path):
+                continue
+            lib = ctypes.CDLL(path)
+            lib.aero_guard_set_budget.argtypes = [ctypes.c_size_t]
+            lib.aero_guard_budget.restype = ctypes.c_size_t
+            lib.aero_guard_start_monitor.argtypes = [ctypes.c_uint]
+            lib.aero_guard_exceeded.restype = c_int
+            lib.aero_guard_own_footprint.restype = ctypes.c_size_t
+            lib.aero_guard_peak_footprint.restype = ctypes.c_size_t
+            lib.aero_guard_system_available.restype = ctypes.c_size_t
+            lib.aero_guard_preflight.argtypes = [ctypes.c_size_t]
+            lib.aero_guard_preflight.restype = c_int
+            cls._inst = cls(lib)
+            return cls._inst
+        raise KernelsUnavailable(
+            "libaero_guard not found; build it with `make guard` (looked in " +
+            ", ".join(_GLIB_CANDIDATES) + ")")
+
+    def set_budget(self, bytes_: int) -> None:
+        self._lib.aero_guard_set_budget(ctypes.c_size_t(int(bytes_)))
+
+    def budget(self) -> int:
+        return int(self._lib.aero_guard_budget())
+
+    def start_monitor(self, interval_ms: int = 50) -> None:
+        self._lib.aero_guard_start_monitor(ctypes.c_uint(interval_ms))
+
+    def stop_monitor(self) -> None:
+        self._lib.aero_guard_stop_monitor()
+
+    def exceeded(self) -> bool:
+        return bool(self._lib.aero_guard_exceeded())
+
+    def own_footprint(self) -> int:
+        return int(self._lib.aero_guard_own_footprint())
+
+    def peak_footprint(self) -> int:
+        return int(self._lib.aero_guard_peak_footprint())
+
+    def system_available(self) -> int:
+        return int(self._lib.aero_guard_system_available())
+
+    def preflight(self, headroom: int = 0) -> bool:
+        return bool(self._lib.aero_guard_preflight(ctypes.c_size_t(headroom)))

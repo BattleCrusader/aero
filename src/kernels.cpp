@@ -150,11 +150,52 @@ inline float q6k_block_dot(const uint8_t* blk, const float* x) {
     return acc;
 }
 
+// ------------------------------------------------------------------ IQ4_XS
+// 256 values in 136 bytes: d(2 fp16) scales_h(2) scales_l(4) qs(128).
+//
+// Structurally DIFFERENT from Q4_K: the quantised value is not affine, it is a
+// LOOKUP into a fixed 16-entry non-linear codebook. So the scale cannot be
+// folded out of a nibble-and-FMA the way Q4_K's can -- but it still factors out
+// of the SUM, because every value in a sub-block shares one dl:
+//
+//     sum_i w[i]*x[i] = dl * sum_i codebook[q_i] * x_i
+//
+// so the weight still never becomes fp32; it costs one table lookup per value.
+// Codebook verified against three independent tables in the reference tree.
+static const float kvalues_iq4nl[16] = {
+    -127.f, -104.f, -83.f, -65.f, -49.f, -35.f, -22.f, -10.f,
+       1.f,   13.f,  25.f,  38.f,  53.f,  69.f,  89.f, 113.f,
+};
+
+inline float iq4xs_block_dot(const uint8_t* blk, const float* x) {
+    const float d = f16_to_f32(static_cast<uint16_t>(blk[0] | (blk[1] << 8)));
+    const uint32_t sh = static_cast<uint32_t>(blk[2] | (blk[3] << 8));
+    const uint8_t* sl = blk + 4;        // 4 bytes of 4-bit scale lows
+    const uint8_t* qs = blk + 8;        // 128 bytes = 256 nibbles
+
+    float acc = 0.0f;
+    for (int ib = 0; ib < 8; ++ib) {                 // 8 sub-blocks of 32
+        const int ls = ((sl[ib >> 1] >> (4 * (ib & 1))) & 0x0F)
+                     | (static_cast<int>((sh >> (2 * ib)) & 3u) << 4);
+        const float dl = d * static_cast<float>(ls - 32);
+        const uint8_t* q = qs + ib * 16;
+        const float* xb = x + ib * 32;
+        float sub = 0.0f;
+        for (int j = 0; j < 16; ++j) {
+            sub += kvalues_iq4nl[q[j] & 0x0F] * xb[j];
+            sub += kvalues_iq4nl[q[j] >> 4]   * xb[j + 16];
+        }
+        acc += dl * sub;
+    }
+    return acc;
+}
+
 // ------------------------------------------------------------------ dispatch
 inline float block_dot(DType t, const uint8_t* blk, const float* x) {
     switch (t) {
         case DType::Q4_K: return q4k_block_dot(blk, x);
         case DType::Q6_K: return q6k_block_dot(blk, x);
+        case DType::IQ4_XS: return iq4xs_block_dot(blk, x);
         default:          return 0.0f;
     }
 }
@@ -185,6 +226,7 @@ const char* dtype_name(DType t) {
         case DType::F16:  return "F16";
         case DType::Q4_K: return "Q4_K";
         case DType::Q6_K: return "Q6_K";
+        case DType::IQ4_XS: return "IQ4_XS";
         case DType::BF16: return "BF16";
     }
     return "unknown";
@@ -197,6 +239,7 @@ int64_t dtype_block_bytes(DType t) {
         case DType::BF16: return 2;
         case DType::Q4_K: return 144;
         case DType::Q6_K: return 210;
+        case DType::IQ4_XS: return 136;
     }
     return 0;
 }
@@ -208,6 +251,7 @@ int64_t dtype_block_values(DType t) {
         case DType::BF16: return 1;
         case DType::Q4_K: return 256;
         case DType::Q6_K: return 256;
+        case DType::IQ4_XS: return 256;
     }
     return 0;
 }
@@ -256,6 +300,28 @@ void dequant_ref(DType t, const uint8_t* raw, float* out, int64_t n_values) {
         }
         return;
     }
+    if (t == DType::IQ4_XS) {
+        for (int64_t b = 0; b < nblocks; ++b) {
+            const uint8_t* blk = raw + b * bb;
+            const float d = f16_to_f32(static_cast<uint16_t>(blk[0] | (blk[1] << 8)));
+            const uint32_t sh = static_cast<uint32_t>(blk[2] | (blk[3] << 8));
+            const uint8_t* sl = blk + 4;
+            const uint8_t* qs = blk + 8;
+            float* o = out + b * 256;
+            for (int ib = 0; ib < 8; ++ib) {
+                const int ls = ((sl[ib >> 1] >> (4 * (ib & 1))) & 0x0F)
+                             | (static_cast<int>((sh >> (2 * ib)) & 3u) << 4);
+                const float dl = d * static_cast<float>(ls - 32);
+                const uint8_t* q = qs + ib * 16;
+                float* ob = o + ib * 32;
+                for (int j = 0; j < 16; ++j) {
+                    ob[j]      = dl * kvalues_iq4nl[q[j] & 0x0F];
+                    ob[j + 16] = dl * kvalues_iq4nl[q[j] >> 4];
+                }
+            }
+        }
+        return;
+    }
     if (t == DType::Q6_K) {
         for (int64_t b = 0; b < nblocks; ++b) {
             const uint8_t* blk = raw + b * bb;
@@ -293,7 +359,7 @@ void dequant_ref(DType t, const uint8_t* raw, float* out, int64_t n_values) {
 // ------------------------------------------------------------------ fusion
 bool matvec(DType dt, const uint8_t* w, const float* x, float* y,
             int64_t n_rows, int64_t n_cols, int threads) {
-    if (dt != DType::Q4_K && dt != DType::Q6_K) return false;
+    if (dt != DType::Q4_K && dt != DType::Q6_K && dt != DType::IQ4_XS) return false;
     const int64_t bv = dtype_block_values(dt);
     const int64_t bb = dtype_block_bytes(dt);
     if (n_cols % bv != 0) return false;
@@ -312,7 +378,7 @@ bool matvec(DType dt, const uint8_t* w, const float* x, float* y,
 
 bool matmul(DType dt, const uint8_t* w, const float* X, float* Y,
             int64_t n_tokens, int64_t n_rows, int64_t n_cols, int threads) {
-    if (dt != DType::Q4_K && dt != DType::Q6_K) return false;
+    if (dt != DType::Q4_K && dt != DType::Q6_K && dt != DType::IQ4_XS) return false;
     const int64_t bv = dtype_block_values(dt);
     const int64_t bb = dtype_block_bytes(dt);
     if (n_cols % bv != 0) return false;
@@ -366,6 +432,7 @@ int aero_dequant_ref(int t, const uint8_t* raw, float* out, int64_t n_values) {
         case aero::DType::F16:
         case aero::DType::Q4_K:
         case aero::DType::Q6_K:
+        case aero::DType::IQ4_XS:
         case aero::DType::BF16:
             aero::dequant_ref(static_cast<aero::DType>(t), raw, out, n_values);
             return 1;

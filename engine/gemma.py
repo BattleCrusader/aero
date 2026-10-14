@@ -60,6 +60,14 @@ class GemmaConfig:
     rope_dims: int
     has_per_layer_embd: bool = False
     n_layer_embd: int = 0
+    # PER-LAYER ROPE. gemma4 gives its windowed and full layers different rotary
+    # geometry entirely: on gemma-4-12b the SWA layers rotate 256 dims at base
+    # 10000 while the global ones rotate 512 at base 1000000. Using one pair of
+    # values for both mis-rotates every layer of one kind.
+    rope_base_swa: Optional[float] = None
+    rope_dims_swa: Optional[int] = None
+    attn_scale: Optional[float] = None      # 1.0 for gemma4: no pre-attn scaling
+    n_kv_shared: int = 0
 
     @staticmethod
     def kv_heads_for(raw, n_layer: int) -> List[int]:
@@ -84,6 +92,22 @@ class GemmaConfig:
                     f"for {n_layer} layers")
             return [bool(x) for x in raw]
         return [bool(raw)] * n_layer
+
+    def is_swa(self, layer: int) -> bool:
+        if self.sliding_pattern is None:
+            return False
+        return bool(self.sliding_pattern[layer])
+
+    def rope_base_at(self, layer: int) -> float:
+        """SWA layers may use a different rotary base than the global ones."""
+        if self.rope_base_swa is not None and self.is_swa(layer):
+            return self.rope_base_swa
+        return self.rope_base
+
+    def rope_dims_at(self, layer: int) -> int:
+        if self.rope_dims_swa is not None and self.is_swa(layer):
+            return self.rope_dims_swa
+        return self.rope_dims
 
     def window_at(self, layer: int) -> Optional[int]:
         """Window for this layer, or None for a global layer.

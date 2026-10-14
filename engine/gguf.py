@@ -43,12 +43,14 @@ T_Q4_0, T_Q4_1 = 2, 3
 T_Q5_0, T_Q5_1 = 6, 7
 T_Q8_0 = 8
 T_Q4_K, T_Q5_K, T_Q6_K = 12, 13, 14
+T_IQ4_XS = 23
 T_BF16 = 30
 
 TYPE_NAMES: Dict[int, str] = {
     T_F32: "F32", T_F16: "F16", T_Q4_0: "Q4_0", T_Q4_1: "Q4_1",
     T_Q5_0: "Q5_0", T_Q5_1: "Q5_1", T_Q8_0: "Q8_0",
-    T_Q4_K: "Q4_K", T_Q5_K: "Q5_K", T_Q6_K: "Q6_K", T_BF16: "BF16",
+    T_Q4_K: "Q4_K", T_Q5_K: "Q5_K", T_Q6_K: "Q6_K", T_IQ4_XS: "IQ4_XS",
+    T_BF16: "BF16",
 }
 
 _SCALAR_FMT = {

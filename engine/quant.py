@@ -19,6 +19,7 @@ T_Q4_0, T_Q4_1 = 2, 3
 T_Q5_0, T_Q5_1 = 6, 7
 T_Q8_0 = 8
 T_Q2_K, T_Q3_K, T_Q4_K, T_Q5_K, T_Q6_K = 10, 11, 12, 13, 14
+T_IQ4_XS = 23
 T_BF16 = 30
 
 QK_K = 256   # K-quant super-block size
@@ -37,6 +38,7 @@ _BLOCK: Dict[int, Tuple[int, int]] = {
     T_Q4_K: (144, QK_K),
     T_Q5_K: (176, QK_K),
     T_Q6_K: (210, QK_K),
+    T_IQ4_XS: (136, QK_K),
 }
 
 
@@ -328,6 +330,33 @@ def matvec_q4k_direct(raw: bytes, shape: Tuple[int, ...],
     return acc.reshape(shape[0], bpr).sum(axis=1)
 
 
+# ---------------------------------------------------------------- IQ4_XS
+# 256 values in 136 bytes: d(2 fp16) scales_h(2) scales_l(4) qs(128).
+# The 4-bit value indexes a fixed non-linear codebook, so this is a lookup, not
+# an affine dequant -- unlike Q4_K. The 6-bit per-sub-block scale is assembled
+# from scales_l (low 4 bits) and scales_h (high 2 bits) and biased by -32.
+_KVALUES_IQ4NL = np.array(
+    [-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113],
+    dtype=np.float32)
+
+
+def _deq_iq4_xs(raw: bytes, n: int) -> np.ndarray:
+    a = np.frombuffer(raw, dtype=np.uint8).reshape(-1, 136)
+    d = _f16(a[:, :2].copy())
+    sh = a[:, 2].astype(np.uint32) | (a[:, 3].astype(np.uint32) << 8)
+    sl = a[:, 4:8]
+    qs = a[:, 8:]                                   # (nb, 128)
+
+    out = np.empty((a.shape[0], QK_K), dtype=np.float32)
+    for ib in range(8):                             # 8 sub-blocks of 32
+        ls = ((sl[:, ib >> 1] >> (4 * (ib & 1))) & 0x0F) |              (((sh >> (2 * ib)) & 3) << 4)
+        dl = (d * (ls.astype(np.float32) - 32.0))[:, None]
+        q = qs[:, ib * 16:(ib + 1) * 16]
+        out[:, ib * 32:ib * 32 + 16] = dl * _KVALUES_IQ4NL[q & 0x0F]
+        out[:, ib * 32 + 16:ib * 32 + 32] = dl * _KVALUES_IQ4NL[q >> 4]
+    return out.reshape(-1)[:n]
+
+
 def dequantize(raw: bytes, type_id: int, shape: Tuple[int, ...]) -> np.ndarray:
     """Dequantise `raw` into a float32 array of `shape` (row-major)."""
     n = 1
@@ -356,6 +385,8 @@ def dequantize(raw: bytes, type_id: int, shape: Tuple[int, ...]) -> np.ndarray:
         out = _deq_q4_k(raw, n)
     elif type_id == T_Q5_K:
         out = _deq_q5_k(raw, n)
+    elif type_id == T_IQ4_XS:
+        out = _deq_iq4_xs(raw, n)
     elif type_id == T_Q6_K:
         out = _deq_q6_k(raw, n)
     else:

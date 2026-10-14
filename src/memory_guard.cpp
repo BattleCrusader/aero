@@ -378,3 +378,40 @@ bool LoadGate::check_measured() {
 }
 
 }  // namespace aero
+
+// --------------------------------------------------------------------- C ABI
+// Flat entry points so Python (ctypes) can arm the SAME guard the C++ tests use,
+// rather than a reimplementation that could drift from it. The guard is a
+// process-wide singleton; these forward to it.
+extern "C" {
+
+void aero_guard_set_budget(size_t bytes) {
+    aero::MemoryGuard::instance().set_budget(bytes);
+}
+size_t aero_guard_budget(void) {
+    return aero::MemoryGuard::instance().budget();
+}
+void aero_guard_start_monitor(unsigned interval_ms) {
+    aero::MemoryGuard::instance().start_monitor(interval_ms);
+}
+void aero_guard_stop_monitor(void) {
+    aero::MemoryGuard::instance().stop_monitor();
+}
+int aero_guard_exceeded(void) {
+    return aero::MemoryGuard::instance().exceeded() ? 1 : 0;
+}
+size_t aero_guard_own_footprint(void) {
+    return aero::MemoryGuard::own_footprint();
+}
+size_t aero_guard_peak_footprint(void) {
+    return aero::MemoryGuard::instance().peak_footprint();
+}
+size_t aero_guard_system_available(void) {
+    return aero::MemoryGuard::system_available();
+}
+int aero_guard_preflight(size_t headroom_bytes) {
+    std::string why;
+    return aero::MemoryGuard::instance().preflight(headroom_bytes, &why) ? 1 : 0;
+}
+
+}  // extern "C"

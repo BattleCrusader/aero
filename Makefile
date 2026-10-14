@@ -18,7 +18,7 @@ PYLIB   := $(wildcard engine/*.py)
 PYTESTS := $(wildcard tests/test_*.py)
 
 .PHONY: all test test-cpp test-engine test-server test-wrappers demo probe \
-        check-py kernels clean
+        check-py kernels guard clean
 
 all: $(BUILD)/test_memory_guard $(BUILD)/test_metal_guard $(BUILD)/aero-load-demo $(BUILD)/aero-bwprobe $(BUILD)/test_kernels $(KLIB)
 
@@ -35,6 +35,21 @@ $(KLIB): $(KSRC) $(KHDR)
 
 kernels: $(KLIB)
 	@echo "native kernels: $(KLIB)"
+
+# The memory guard as a shared library, so Python arms the SAME guard the C++
+# tests exercise. A reimplementation in Python would be a second thing to keep
+# correct; a shared library cannot drift.
+GLIB := $(BUILD)/libaero_guard.dylib
+
+$(GLIB): $(SRC) $(HDR)
+	@mkdir -p $(BUILD)
+	$(CXX) $(CXXFLAGS) -fPIC -shared $(SRC) -o $@
+
+guard: $(GLIB)
+	@echo "memory guard: $(GLIB)"
+
+all: $(GLIB)
+kernels-all: $(KLIB) $(GLIB)
 
 
 $(BUILD)/test_memory_guard: $(SRC) tests/test_memory_guard.cpp $(HDR)

@@ -38,11 +38,12 @@ namespace aero {
 // disk actually use are implemented; anything else must be refused by the
 // caller rather than silently misread.
 enum class DType : int {
-    F32  = 0,
-    F16  = 1,
-    Q4_K = 12,
-    Q6_K = 14,
-    BF16 = 30,
+    F32    = 0,
+    F16    = 1,
+    Q4_K   = 12,
+    Q6_K   = 14,
+    IQ4_XS = 23,
+    BF16   = 30,
 };
 
 const char* dtype_name(DType t);

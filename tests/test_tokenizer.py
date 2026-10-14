@@ -159,21 +159,57 @@ def test_negatives(tk):
         check(False, "an empty vocab must raise")
     except ValueError:
         check(True, "an empty vocab raises")
-    # a non-gpt2 tokenizer model must be refused (only gpt2 is implemented)
+    # TWO families are supported now: 'gpt2' (byte-level BPE, qwen) and
+    # 'llama'/'spm'/'gemma*' (sentencepiece). 'llama' must therefore be ACCEPTED --
+    # this assertion used to require a refusal, which stopped being true when
+    # gemma4 support landed. A genuinely unknown model is still refused.
     class _FakeKV(dict):
         arch = staticmethod(lambda: "qwen35")
     fake = _FakeKV({
-        "tokenizer.ggml.tokens": ["a"],
-        "tokenizer.ggml.merges": ["a a"],
+        "tokenizer.ggml.tokens": ["a", "b", "ab"],
+        "tokenizer.ggml.merges": ["a b"],
         "tokenizer.ggml.model": "llama",
     })
     class _FakeR:
         kv = fake
     try:
-        Tokenizer.from_gguf(_FakeR())
-        check(False, "a non-gpt2 tokenizer model must be refused")
+        tk_spm = Tokenizer.from_gguf(_FakeR())
+        check(tk_spm.vocab_type == "spm",
+              "a 'llama' tokenizer loads as the sentencepiece family")
+        # and the families must genuinely differ on SPACE handling: spm maps a
+        # space to U+2581 (one token 'a▁b'), gpt2 maps it to U+0120 and splits
+        # differently. The fixture must be large enough for a merge to fire,
+        # otherwise both paths emit the same single characters and the check is
+        # vacuous -- which is exactly what the first version of this test did.
+        tk_gpt2 = Tokenizer(tokens=["a\u0120", "\u0120b", "a", "b"],
+                            merges=["a \u0120"], vocab_type="gpt2")
+        tk_spm = Tokenizer(tokens=["a\u2581", "\u2581b", "a", "b"],
+                           merges=["a \u2581"], vocab_type="spm")
+        # 'a b': spm turns the space into U+2581 and merges 'a▁'; gpt2 keeps the
+        # byte-remapped U+0120 and merges that instead. Different pieces, so the
+        # id sequences must differ.
+        check(tk_spm.encode("a b") != tk_gpt2.encode("a b"),
+              "the two families produce different ids for the same text "
+              "(the flag is not decorative)")
     except ValueError as e:
-        check("gpt2" in str(e), "a non-gpt2 model raises with an explanation")
+        check(False, f"'llama' must be accepted now: {e}")
+
+    # a genuinely unknown tokenizer model is still refused
+    class _FakeKV2(dict):
+        arch = staticmethod(lambda: "qwen35")
+    fake2 = _FakeKV2({
+        "tokenizer.ggml.tokens": ["a"],
+        "tokenizer.ggml.merges": ["a a"],
+        "tokenizer.ggml.model": "some-future-format",
+    })
+    class _FakeR2:
+        kv = fake2
+    try:
+        Tokenizer.from_gguf(_FakeR2())
+        check(False, "an unknown tokenizer model must be refused")
+    except ValueError as e:
+        check("unsupported" in str(e).lower(),
+              "an unknown model raises with an explanation")
     # and a file with NO tokenizer must say so, not return garbage
     class _NoTok:
         kv = {"general.architecture": "qwen35"}
