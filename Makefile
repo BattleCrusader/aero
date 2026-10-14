@@ -18,9 +18,9 @@ PYLIB   := $(wildcard engine/*.py)
 PYTESTS := $(wildcard tests/test_*.py)
 
 .PHONY: all test test-cpp test-engine test-server test-wrappers demo probe \
-        check-py kernels guard clean
+        check-py kernels guard engine-cpp clean
 
-all: $(BUILD)/test_memory_guard $(BUILD)/test_metal_guard $(BUILD)/aero-load-demo $(BUILD)/aero-bwprobe $(BUILD)/test_kernels $(KLIB)
+all: $(BUILD)/test_memory_guard $(BUILD)/test_metal_guard $(BUILD)/aero-load-demo $(BUILD)/aero-bwprobe $(BUILD)/test_kernels $(BUILD)/test_tensor $(KLIB)
 
 # ---- native kernels ----
 # The test binary links the kernel TU directly, so `make test-cpp` proves the
@@ -35,6 +35,17 @@ $(KLIB): $(KSRC) $(KHDR)
 
 kernels: $(KLIB)
 	@echo "native kernels: $(KLIB)"
+
+# ---- the C++ engine modules (tensor primitives first; the layer loop follows) --
+TSRC := src/tensor.cpp
+THDR := include/aero/tensor.hpp
+
+$(BUILD)/test_tensor: $(TSRC) tests/test_tensor.cpp $(THDR)
+	@mkdir -p $(BUILD)
+	$(CXX) -std=c++17 $(CXXFLAGS) $(TSRC) tests/test_tensor.cpp -o $@ -pthread
+
+engine-cpp: $(BUILD)/test_tensor
+	@./$(BUILD)/test_tensor
 
 # The memory guard as a shared library, so Python arms the SAME guard the C++
 # tests exercise. A reimplementation in Python would be a second thing to keep
@@ -86,6 +97,8 @@ test-cpp: all
 	@./$(BUILD)/test_metal_guard
 	@echo
 	@./$(BUILD)/test_kernels
+	@echo
+	@./$(BUILD)/test_tensor
 
 test-engine: check-py
 	@if [ -x "$(PY)" ]; then $(PY) tests/test_engine.py; \

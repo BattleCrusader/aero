@@ -95,13 +95,22 @@ def test_guard_refuses():
         check(dt < 5.0,
               f"refusal was fast ({dt*1000:.0f} ms) -- no weight data was read")
 
-    # a generous cap must NOT refuse
+    # a generous cap must NOT refuse -- unless another process holds the model
+    # load lock, in which case the refusal IS the correct behaviour and this test
+    # must skip rather than fail. (Without this the suite fails whenever any other
+    # aero process happens to be running, which is a false alarm, not a defect.)
     rt2 = GgufRuntime(max_ram="64GB", context=256)
     try:
         rt2.load(QWEN)
         check(rt2.model is not None, "a 2.6 GB model loads under a 64 GB cap")
         check(rt2.guard is not None, "the guard exists when a cap is given")
         rt2.close()
+    except RuntimeError as e:
+        if "already holds the model-load lock" in str(e):
+            print("       (skipped: another aero process holds the load lock -- "
+                  "the refusal is correct behaviour)")
+        else:
+            check(False, f"should have loaded: {type(e).__name__}: {e}")
     except Exception as e:
         check(False, f"should have loaded: {type(e).__name__}: {e}")
 
