@@ -17,8 +17,8 @@ PYTOOLS := $(wildcard tools/*.py)
 PYLIB   := $(wildcard engine/*.py)
 PYTESTS := $(wildcard tests/test_*.py)
 
-.PHONY: all test test-cpp test-engine test-server test-wrappers demo probe \
-        check-py kernels guard engine-cpp clean
+.PHONY: all test test-cpp test-engine test-server test-wrappers demo probe test-cached test-cache-status \
+        test-cache-clear check-py kernels guard engine-cpp clean
 
 all: $(BUILD)/test_memory_guard $(BUILD)/test_metal_guard $(BUILD)/aero-load-demo $(BUILD)/aero-bwprobe $(BUILD)/test_kernels $(BUILD)/test_tensor $(BUILD)/test_ssm_cpp $(BUILD)/test_gguf $(BUILD)/test_transformer $(KLIB) $(SLIB) $(XLIB) $(TLIB)
 
@@ -248,6 +248,45 @@ test-wrappers: all check-py
 		&& echo "aero-serve : limits path ok"
 
 # Canonical gate.
+
+
+
+# ---- content-addressed test cache -------------------------------------------
+# `make test` costs ~130s and test-model is ~112s of it: 29 Python interpreter
+# starts, most of which load a model. Re-running that to re-learn a known result
+# is pure waste. `make test-cached` reuses a suite's PASS only while the hash of
+# its inputs (the suite, the whole engine/ package, tools/, the native .dylibs and
+# this Makefile) is unchanged. A FAIL is never cached and never skipped --
+# verified by EXECUTION COUNTER, not by label: a failing suite re-executes every
+# time, a passing one executes once then is served from cache.
+TC := $(PY) tools/test_cache.py
+
+test-cached: all
+	@$(TC) run quant                tests/test_quant.py
+	@$(TC) run transformer          tests/test_transformer.py
+	@$(TC) run optimizations        tests/test_optimizations.py
+	@$(TC) run ssm                  tests/test_ssm.py
+	@$(TC) run ssm_native           tests/test_ssm_native.py
+	@$(TC) run model                tests/test_model.py
+	@$(TC) run kv                   tests/test_kv.py
+	@$(TC) run prerope              tests/test_prerope.py
+	@$(TC) run tokenizer            tests/test_tokenizer.py
+	@$(TC) run chat_template        tests/test_chat_template.py
+	@$(TC) run pread                tests/test_pread.py
+	@$(TC) run tensor_native        tests/test_tensor_native.py
+	@$(TC) run dequant_threads      tests/test_dequant_threads.py
+	@$(TC) run native               tests/test_native.py
+	@$(TC) run transformer_native   tests/test_transformer_native.py
+	@$(TC) run coherence            tests/test_coherence.py
+	@$(TC) run arch                 tests/test_arch.py
+	@$(TC) run runtime_gguf         tests/test_runtime_gguf.py
+
+test-cache-status:
+	@$(TC) status
+
+test-cache-clear:
+	@$(TC) clear
+
 test: test-cpp test-engine test-server test-wrappers test-model
 
 demo: $(BUILD)/aero-load-demo
