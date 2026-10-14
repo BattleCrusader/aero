@@ -134,9 +134,20 @@ void rmsnorm(const Vec& x, const Vec& weight, Vec& out, float eps) {
 }
 
 void l2norm(const Vec& x, const Vec& weight, Vec& out, float eps, bool weighted) {
+    // Denominator is max(||x||, eps) -- eps is a FLOOR ON THE NORM, not an additive
+    // term inside the sqrt. The two differ: with ||x||=50, max(50,1e-6)=50 while
+    // sqrt(2500+1e-6)=50.00000002, a small but CONSISTENT relative offset that
+    // looks like fp32 noise and is not. They coincide only when ||x|| >> eps, which
+    // is exactly the regime the SSM q/k vectors live in, so this was silent.
+    //
+    // Matches engine/ssm.py:l2_normalize, which is the definition the model was
+    // written against:
+    //     n = np.linalg.norm(x); return x / np.maximum(n, eps)
     float ss = 0.0f;
     for (int64_t i = 0; i < x.n; ++i) ss += x.data[i] * x.data[i];
-    const float inv = 1.0f / std::sqrt(ss + eps);
+    const float norm = std::sqrt(ss);
+    const float denom = norm > eps ? norm : eps;
+    const float inv = 1.0f / denom;
     for (int64_t i = 0; i < x.n; ++i)
         out.data[i] = x.data[i] * inv *
                       (weighted && weight.data ? weight.data[i] : 1.0f);
@@ -174,4 +185,120 @@ int argmax(const Vec& v) {
     return best;
 }
 
+// ============================================================ C ABI
+//
+// Why this block exists at all: every primitive below was already implemented,
+// tested and correct -- and completely unreachable from the engine, because
+// tensor.cpp exported nothing and was compiled only into its own test binary. That
+// is why the forward pass still ran in numpy while "the tensor primitives are
+// done" was true. A primitive nobody can call is not ported; it is a private
+// implementation detail. These wrappers make the existing functions callable.
+//
+// Conventions, applied uniformly so ctypes stays simple:
+//   * buffers are flat row-major fp32, lengths passed explicitly;
+//   * a length of 0 or less is REFUSED (returns 0) rather than treated as empty,
+//     because a wrong length is the bug class that already segfaulted this repo;
+//   * void returns are 1 on success, 0 on refusal.
+
 }  // namespace aero
+
+extern "C" {
+
+int aero_tensor_threads(void) { return aero::tensor_default_threads(); }
+
+// y[r] = dot(W.row(r), x); W is (n_rows, n_cols), x has n_cols, y gets n_rows.
+int aero_tensor_matvec(const float* w, const float* x, float* y,
+                       int64_t n_rows, int64_t n_cols, int threads) {
+    if (!w || !x || !y || n_rows <= 0 || n_cols <= 0) return 0;
+    aero::Tensor2D vw{const_cast<float*>(w), n_rows, n_cols};
+    aero::Vec vx{const_cast<float*>(x), n_cols};
+    aero::Vec vy{y, n_rows};
+    aero::matvec(vw, vx, vy, threads);
+    return 1;
+}
+
+// Y[t][r] = dot(W.row(r), X.row(t)); W (n_rows,n_cols), X (n_tokens,n_cols),
+// Y (n_tokens,n_rows).
+int aero_tensor_matmul(const float* w, const float* X, float* Y,
+                       int64_t n_tokens, int64_t n_rows, int64_t n_cols,
+                       int threads) {
+    if (!w || !X || !Y || n_tokens <= 0 || n_rows <= 0 || n_cols <= 0) return 0;
+    aero::Tensor2D vw{const_cast<float*>(w), n_rows, n_cols};
+    aero::Tensor2D vX{const_cast<float*>(X), n_tokens, n_cols};
+    aero::Tensor2D vY{Y, n_tokens, n_rows};
+    aero::matmul(vw, vX, vY, threads);
+    return 1;
+}
+
+// in-place activations
+int aero_tensor_silu(float* v, int64_t n) {
+    if (!v || n <= 0) return 0;
+    aero::silu_(aero::Vec{v, n});
+    return 1;
+}
+
+int aero_tensor_gelu(float* v, int64_t n) {
+    if (!v || n <= 0) return 0;
+    aero::gelu_(aero::Vec{v, n});
+    return 1;
+}
+
+int aero_tensor_softmax(float* v, int64_t n) {
+    if (!v || n <= 0) return 0;
+    aero::softmax_(aero::Vec{v, n});
+    return 1;
+}
+
+// a[i] *= b[i]
+int aero_tensor_mul(float* a, const float* b, int64_t n) {
+    if (!a || !b || n <= 0) return 0;
+    aero::mul_(aero::Vec{a, n}, aero::Vec{const_cast<float*>(b), n});
+    return 1;
+}
+
+// gate[i] = silu(gate[i]) * up[i], in place on gate
+int aero_tensor_swiglu(float* gate, const float* up, int64_t n) {
+    if (!gate || !up || n <= 0) return 0;
+    aero::swiglu_(aero::Vec{gate, n}, aero::Vec{const_cast<float*>(up), n});
+    return 1;
+}
+
+// out = x / sqrt(mean(x^2) + eps) * weight
+int aero_tensor_rmsnorm(const float* x, const float* weight, float* out,
+                        int64_t n, float eps) {
+    if (!x || !weight || !out || n <= 0) return 0;
+    aero::Vec vx{const_cast<float*>(x), n};
+    aero::Vec vw{const_cast<float*>(weight), n};
+    aero::Vec vo{out, n};
+    aero::rmsnorm(vx, vw, vo, eps);
+    return 1;
+}
+
+// out = x / sqrt(sum(x^2) + eps) * weight   (weighted = 1), or weightless
+// (weighted = 0, weight may be NULL) -- the SSM q/k and gemma4 V normalisations.
+int aero_tensor_l2norm(const float* x, const float* weight, float* out,
+                       int64_t n, float eps, int weighted) {
+    if (!x || !out || n <= 0) return 0;
+    if (weighted && !weight) return 0;
+    aero::Vec vx{const_cast<float*>(x), n};
+    aero::Vec vw{const_cast<float*>(weight), n};
+    aero::Vec vo{out, n};
+    aero::l2norm(vx, vw, vo, eps, weighted != 0);
+    return 1;
+}
+
+// Per-row weightless RMS over a 2-D block, in place. rows x cols fp32.
+int aero_tensor_rmsnorm_rows(float* t, int64_t rows, int64_t cols, float eps) {
+    if (!t || rows <= 0 || cols <= 0) return 0;
+    aero::Tensor2D v{t, rows, cols};
+    aero::rmsnorm_rows(v, eps);
+    return 1;
+}
+
+int aero_tensor_argmax(const float* v, int64_t n) {
+    if (!v || n <= 0) return -1;
+    aero::Vec vv{const_cast<float*>(v), n};
+    return aero::argmax(vv);
+}
+
+}  // extern "C"

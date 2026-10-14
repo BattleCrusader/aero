@@ -20,7 +20,7 @@ PYTESTS := $(wildcard tests/test_*.py)
 .PHONY: all test test-cpp test-engine test-server test-wrappers demo probe \
         check-py kernels guard engine-cpp clean
 
-all: $(BUILD)/test_memory_guard $(BUILD)/test_metal_guard $(BUILD)/aero-load-demo $(BUILD)/aero-bwprobe $(BUILD)/test_kernels $(BUILD)/test_tensor $(BUILD)/test_gguf $(KLIB)
+all: $(BUILD)/test_memory_guard $(BUILD)/test_metal_guard $(BUILD)/aero-load-demo $(BUILD)/aero-bwprobe $(BUILD)/test_kernels $(BUILD)/test_tensor $(BUILD)/test_ssm_cpp $(BUILD)/test_gguf $(BUILD)/test_transformer $(KLIB) $(SLIB) $(XLIB) $(TLIB)
 
 # ---- native kernels ----
 # The test binary links the kernel TU directly, so `make test-cpp` proves the
@@ -39,10 +39,60 @@ kernels: $(KLIB)
 # ---- the C++ engine modules (tensor primitives first; the layer loop follows) --
 TSRC := src/tensor.cpp
 THDR := include/aero/tensor.hpp
+TLIB := $(BUILD)/libaero_tensor.dylib
+
+# tensor.cpp used to be compiled ONLY into its own test binary, so its primitives
+# were unreachable from the engine -- which is why the forward pass still ran in
+# numpy while the C++ primitives were "done". Ship it as a library.
+$(TLIB): $(TSRC) $(THDR)
+	@mkdir -p $(BUILD)
+	$(CXX) -std=c++17 $(CXXFLAGS) -fPIC -shared $(TSRC) -o $@ -pthread
+
+tensor-lib: $(TLIB)
+	@echo "native tensor primitives: $(TLIB)"
 
 $(BUILD)/test_tensor: $(TSRC) tests/test_tensor.cpp $(THDR)
 	@mkdir -p $(BUILD)
 	$(CXX) -std=c++17 $(CXXFLAGS) $(TSRC) tests/test_tensor.cpp -o $@ -pthread
+
+# ---- SSM (gated delta net) + MoE inner loops, and their Python binding ----
+# A separate library from the quantized kernels: this is fp32 arithmetic over
+# weights Python has already dequantised, so it must NOT be built with
+# -ffast-math (reassociation would break the fp32 match against numpy).
+SSMSRC := src/ssm.cpp src/moe.cpp
+SSMHDR := include/aero/ssm.hpp include/aero/moe.hpp
+SLIB   := $(BUILD)/libaero_ssm.dylib
+
+$(SLIB): $(SSMSRC) $(SSMHDR)
+	@mkdir -p $(BUILD)
+	$(CXX) -std=c++17 $(CXXFLAGS) -fPIC -shared $(SSMSRC) -o $@
+
+$(BUILD)/test_ssm_cpp: $(SSMSRC) tests/test_ssm_cpp.cpp $(SSMHDR)
+	@mkdir -p $(BUILD)
+	$(CXX) -std=c++17 $(CXXFLAGS) $(SSMSRC) tests/test_ssm_cpp.cpp -o $@ -pthread
+
+ssm: $(SLIB)
+	@echo "ssm/moe kernels: $(SLIB)"
+
+# ---- transformer primitives (RoPE + attention), and their Python binding ----
+# Like the SSM library, this is fp32 arithmetic compared against numpy, so it
+# must NOT be built with -ffast-math (reassociation would break the match).
+# It reuses src/tensor.cpp for the norms/activations rather than reimplementing
+# them, so tensor.cpp is linked in too.
+XSRC := src/transformer.cpp
+XHDR := include/aero/transformer.hpp
+XLIB := $(BUILD)/libaero_transformer.dylib
+
+$(XLIB): $(XSRC) $(TSRC) $(XHDR) $(THDR)
+	@mkdir -p $(BUILD)
+	$(CXX) -std=c++17 $(CXXFLAGS) -fPIC -shared $(XSRC) $(TSRC) -o $@ -pthread
+
+transformer: $(XLIB)
+	@echo "transformer primitives: $(XLIB)"
+
+$(BUILD)/test_transformer: $(XSRC) $(TSRC) tests/test_transformer_cpp.cpp $(XHDR) $(THDR)
+	@mkdir -p $(BUILD)
+	$(CXX) -std=c++17 $(CXXFLAGS) $(XSRC) $(TSRC) tests/test_transformer_cpp.cpp -o $@ -pthread
 
 # gguf reader. Needs kernels.cpp too: it dequantises and matvecs through the fused
 # kernels, and the test proves that path works on a real file.
@@ -55,12 +105,35 @@ $(BUILD)/test_gguf: $(GSRC) $(KSRC) tests/test_gguf_cpp.cpp $(GHDR) $(KHDR)
 	@mkdir -p $(BUILD)
 	$(CXX) -std=c++17 $(CXXFLAGS) $(GSRC) $(KSRC) tests/test_gguf_cpp.cpp -o $@ -pthread
 
-engine-cpp: $(BUILD)/test_tensor $(BUILD)/test_gguf
+engine-cpp: $(BUILD)/test_tensor $(BUILD)/test_gguf $(BUILD)/test_model_cpp
 	@./$(BUILD)/test_tensor
 	@echo
 	@if [ -f "$(REAL_MODEL)" ]; then \
 		AERO_MAX_RAM=$${AERO_MAX_RAM:-5G} ./$(BUILD)/test_gguf "$(REAL_MODEL)"; \
 	 else echo "gguf test: SKIPPED (no $(REAL_MODEL))"; fi
+	@echo
+	@./$(BUILD)/test_model_cpp
+
+# ---- the native model module (the per-layer block loop) ----
+# It owns the block loop and calls the fused kernels directly on the mmap. The
+# attention / SSM / MoE primitives are registered through a function-pointer
+# table (see include/aero/model.hpp), so those modules are NOT linked here.
+MSRC := src/model.cpp
+MHDR := include/aero/model.hpp
+MLIB := $(BUILD)/libaero_model.dylib
+
+$(MLIB): $(MSRC) $(MHDR) $(GSRC) $(GHDR) $(KSRC) $(KHDR) $(TSRC) $(THDR)
+	@mkdir -p $(BUILD)
+	$(CXX) -std=c++17 $(CXXFLAGS) -fPIC -shared $(MSRC) $(GSRC) $(KSRC) $(TSRC) \
+		-o $@ -pthread
+
+$(BUILD)/test_model_cpp: $(MSRC) tests/test_model_cpp.cpp $(MHDR) $(GSRC) $(KSRC) $(TSRC) $(GHDR) $(KHDR) $(THDR)
+	@mkdir -p $(BUILD)
+	$(CXX) -std=c++17 $(CXXFLAGS) $(MSRC) $(GSRC) $(KSRC) $(TSRC) \
+		tests/test_model_cpp.cpp -o $@ -pthread
+
+model-cpp: $(BUILD)/test_model_cpp
+	@./$(BUILD)/test_model_cpp
 
 # The memory guard as a shared library, so Python arms the SAME guard the C++
 # tests exercise. A reimplementation in Python would be a second thing to keep
@@ -115,6 +188,10 @@ test-cpp: all
 	@echo
 	@./$(BUILD)/test_tensor
 	@echo
+	@./$(BUILD)/test_ssm_cpp
+	@echo
+	@./$(BUILD)/test_transformer
+	@echo
 	@if [ -f "$(REAL_MODEL)" ]; then \
 		AERO_MAX_RAM=$${AERO_MAX_RAM:-5G} ./$(BUILD)/test_gguf "$(REAL_MODEL)"; \
 	 else echo "gguf test: SKIPPED (no $(REAL_MODEL))"; fi
@@ -134,14 +211,17 @@ test-model: check-py
 		$(PY) tests/test_transformer.py; echo; \
 		$(PY) -W error::RuntimeWarning tests/test_optimizations.py; echo; \
 		$(PY) -W error::RuntimeWarning tests/test_ssm.py; echo; \
+		$(PY) -W error::RuntimeWarning tests/test_ssm_native.py 2>&1 | tail -40; echo; \
 		$(PY) -W error::RuntimeWarning tests/test_model.py; echo; \
 		AERO_SKIP_SLOW=1 $(PY) -W error::RuntimeWarning tests/test_kv.py 2>&1 | tail -25; echo; \
 		AERO_SKIP_SLOW=1 $(PY) -W error::RuntimeWarning tests/test_prerope.py 2>&1 | tail -20; echo; \
 		$(PY) -W error::RuntimeWarning tests/test_tokenizer.py 2>&1 | tail -30; echo; \
 		$(PY) -W error::RuntimeWarning tests/test_chat_template.py 2>&1 | tail -12; echo; \
 		$(PY) -W error::RuntimeWarning tests/test_pread.py 2>&1 | tail -14; echo; \
+		$(PY) -W error::RuntimeWarning tests/test_tensor_native.py 2>&1 | tail -10; echo; \
 		$(PY) -W error::RuntimeWarning tests/test_dequant_threads.py 2>&1 | tail -8; echo; \
 		$(PY) -W error::RuntimeWarning tests/test_native.py 2>&1 | tail -25; echo; \
+		$(PY) tests/test_transformer_native.py 2>&1 | tail -40; echo; \
 		AERO_SKIP_SLOW=1 $(PY) -W error::RuntimeWarning tests/test_coherence.py 2>&1 | tail -20; \
 		$(PY) tests/test_arch.py 2>&1 | tail -30; echo; \
 		AERO_SKIP_SLOW=1 $(PY) tests/test_runtime_gguf.py 2>&1 | tail -20; \
