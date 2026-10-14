@@ -357,7 +357,7 @@ void GgufReader::dequantise(const TensorInfo& t, float* out) const {
     if (!ggml_type_supported(t.type))
         throw std::runtime_error(std::string("GGUF: no dequantiser for ") +
                                  ggml_type_name(t.type));
-    dequant_ref((DType)(int)t.type, tensor_data(t), out, t.n_elements);
+    dequant_ref((DType)(int)t.type, tensor_data(t), tensor_bytes(t), out, t.n_elements);
 }
 
 bool GgufReader::matvec(const TensorInfo& t, const float* x, float* y, int threads) const {

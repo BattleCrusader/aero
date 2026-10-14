@@ -64,6 +64,14 @@ def _load():
                 c_int64, c_int64, c_int64, c_int,
             ]
             lib.aero_matmul.restype = c_int
+            lib.aero_dequant_threaded.argtypes = [
+                c_int, POINTER(c_uint8), c_int64, POINTER(c_float), c_int64, c_int,
+            ]
+            lib.aero_dequant_threaded.restype = c_int
+            lib.aero_dequant_ref.argtypes = [
+                c_int, POINTER(c_uint8), c_int64, POINTER(c_float), c_int64,
+            ]
+            lib.aero_dequant_ref.restype = c_int
             lib.aero_dtype_block_bytes.argtypes = [c_int]
             lib.aero_dtype_block_bytes.restype = c_int64
             lib.aero_dtype_block_values.argtypes = [c_int]
@@ -72,7 +80,11 @@ def _load():
             lib.aero_hardware_threads.restype = c_int
             _lib = lib
             return _lib
-        except OSError as e:                      # pragma: no cover
+        except (OSError, AttributeError) as e:
+            # AttributeError, not just OSError: ctypes raises AttributeError when a
+            # dlsym lookup misses, so a library that loads but is missing one symbol
+            # used to escape this handler entirely and crash the caller instead of
+            # falling back. That turned "stale .dylib" into "engine is broken".
             _load_error = f"{path}: {e}"
     if _load_error is None:
         _load_error = ("libaero_kernels not found; build it with "
@@ -120,12 +132,60 @@ def _u8(arr):
     raise TypeError(f"expected bytes-like, got {type(arr).__name__}")
 
 
-def dequant(dtype: int, raw, shape):
+# Values per block, mirrored from the kernel so a thread split lands on block
+# boundaries without a round trip. Kept as a literal dict so this module imports
+# no engine state (it is a leaf binding).
+_BLOCK_VALUES = {DTYPE_F32: 1, DTYPE_F16: 1, DTYPE_Q4_K: 256, DTYPE_Q6_K: 256,
+                 DTYPE_IQ4_XS: 256, DTYPE_BF16: 1}
+
+_BLOCK_BYTES = {DTYPE_F32: 4, DTYPE_F16: 2, DTYPE_Q4_K: 144, DTYPE_Q6_K: 210,
+                DTYPE_IQ4_XS: 136, DTYPE_BF16: 2}
+
+_threads_hint = 0
+
+
+def hw_threads() -> int:
+    """Hardware thread count, cached. 0 when the library is absent."""
+    global _threads_hint
+    if _threads_hint:
+        return _threads_hint
+    lib = _load()
+    if lib is None:
+        return 0
+    _threads_hint = int(lib.aero_hardware_threads())
+    return _threads_hint
+
+
+def _raw_nbytes(raw, dtype: int, n_values: int) -> int:
+    """Bytes the caller actually passed, so the kernel can bounds-check.
+
+    A memoryview/bytes carries its own length; anything else has to be sized from
+    the dtype. Never returns more than the caller has, because over-reporting
+    would re-enable the out-of-bounds read this exists to prevent.
+    """
+    try:
+        return len(raw)
+    except TypeError:
+        pass
+    bv = _BLOCK_VALUES.get(dtype, 0)
+    if not bv:
+        return 0
+    bb = _BLOCK_BYTES.get(dtype, 0)
+    return (n_values // bv) * bb
+
+
+def dequant(dtype: int, raw, shape, threads: int = 0):
     """Dequantise a whole tensor with the native kernel.
 
     Returns a numpy array of `shape`. Raises KernelsUnavailable when the library
     is missing so the caller can fall back to the Python dequantiser rather than
     silently getting a wrong buffer.
+
+    `threads` defaults to 0 meaning "pick one": the thread count is clamped to the
+    tensor's block count, because spreading a 512-block tensor over 8 threads and
+    one of 2 blocks over 8 threads want different answers, and below ~8 blocks the
+    fork/join costs more than the work. Measured on the 280 tensors a gemma-4
+    decode loads, this is the difference between ~11.7 s and ~2 s of dequantise.
     """
     import numpy as np
 
@@ -140,10 +200,27 @@ def dequant(dtype: int, raw, shape):
         n *= int(d)
     out = np.empty(n, dtype=np.float32)
     rawbuf = _u8(raw)
-    ok = lib.aero_dequant_ref(int(dtype), rawbuf,
-                              out.ctypes.data_as(POINTER(c_float)), c_int64(n))
+
+    if threads == 0:
+        bv = _BLOCK_VALUES.get(dtype, 0)
+        nblocks = (n // bv) if bv else 0
+        hw = hw_threads()
+        threads = hw if nblocks >= 2 * max(hw, 1) else 1
+
+    # raw_len is passed so the kernel can refuse a short buffer instead of
+    # reading past it -- passing a length it never received segfaulted the suite.
+    rl = c_int64(_raw_nbytes(raw, dtype, n))
+    if threads > 1:
+        fn = lib.aero_dequant_threaded
+        ok = fn(int(dtype), rawbuf, rl, out.ctypes.data_as(POINTER(c_float)),
+                c_int64(n), c_int(int(threads)))
+    else:
+        ok = lib.aero_dequant_ref(int(dtype), rawbuf, rl,
+                                  out.ctypes.data_as(POINTER(c_float)), c_int64(n))
     if not ok:
-        raise ValueError(f"native dequant refused dtype={dtype} n={n}")
+        raise ValueError(
+            f"native dequant refused dtype={dtype} n={n} raw_len={int(rl.value)} "
+            f"(buffer too short, or the type/dimension combination is unsupported)")
     return out.reshape(shape)
 
 

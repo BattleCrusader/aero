@@ -57,7 +57,26 @@ int64_t dtype_block_values(DType t);
 // Straightforward, obviously-correct dequantisation. Used as the test oracle
 // and as the fallback for types without a fused kernel. `raw` must hold
 // n_values worth of whole blocks; `out` receives n_values floats.
-void dequant_ref(DType t, const uint8_t* raw, float* out, int64_t n_values);
+//
+// `raw_len` is how many bytes the caller ACTUALLY has, and is checked against
+// what `n_values` demands before a single block is touched. The kernel cannot
+// otherwise know: it is handed a bare pointer, so a caller that passes a short
+// buffer (truncated read, wrong offset, a slice) makes it read past the end.
+// That is not hypothetical -- it segfaulted the test suite. Pass the real length;
+// the check costs one comparison per call and refuses instead of reading OOB.
+// Returns false when the buffer is too short or the type has no dequantiser, so
+// a caller can fall back rather than compute something wrong.
+bool dequant_ref(DType t, const uint8_t* raw, int64_t raw_len,
+                 float* out, int64_t n_values);
+
+// Threaded dequantisation, block-parallel: every block is independent, so this
+// splits on block index and is bit-identical to dequant_ref. Measured on M1:
+// dequantising the 280 tensors a gemma-4 decode pulls through tensor() cost
+// ~11.7 s single-threaded -- more than the 6.2 s disk read it depends on -- which
+// made dequantise, not I/O or arithmetic, the largest single cost in a token.
+// `threads` <= 1 runs serially. Checks `raw_len` exactly as dequant_ref does.
+bool dequant_threaded(DType t, const uint8_t* raw, int64_t raw_len,
+                      float* out, int64_t n_values, int threads);
 
 // ------------------------------------------------------------------ fused ops
 // y = W @ x, W is (n_rows, n_cols) in `dt`. x has n_cols elements, y n_rows.

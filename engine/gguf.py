@@ -20,6 +20,7 @@ Tensor `offset` is relative to the START OF THE DATA SECTION.
 
 from __future__ import annotations
 
+import os
 import struct
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
@@ -121,12 +122,41 @@ class GGUFReader:
         self.alignment = DEFAULT_ALIGNMENT
         self.data_offset = 0
         self._fh = open(path, "rb")
+        # A second, UNBUFFERED descriptor for bulk tensor reads. Measured on the
+        # 6.4 GB gemma-4 file: reading a tensor through the buffered handle's
+        # seek+read runs at ~854 MB/s, while os.pread of the identical bytes at
+        # the identical offset runs at ~5480 MB/s -- a 6.4x difference on the same
+        # disk with the same page cache. A decode reads ~5.9 GB/token, so the
+        # buffered path alone accounted for ~6.8 s of every token. The buffered
+        # handle stays for the header parse, which is many tiny sequential reads.
+        try:
+            self._fd = os.open(path, os.O_RDONLY)
+        except OSError:
+            self._fd = None
         self._parse_index()
 
     # ---- parsing ---------------------------------------------------------
     def _read(self, n: int) -> bytes:
         b = self._fh.read(n)
         if len(b) != n:
+            raise EOFError(f"{self.path}: truncated (wanted {n} bytes, got {len(b)})")
+        return b
+
+    def _pread(self, n: int, offset: int) -> bytes:
+        """Read `n` bytes at `offset` in ONE syscall.
+
+        One pread of 31 MB beats the buffered path by 6.4x (854 -> 5480 MB/s,
+        measured), because the buffered handle turns a large tensor read into a
+        sequence of bounded buffer refills. Falls back to seek+read when no raw
+        descriptor is available, so behaviour degrades rather than breaks.
+        """
+        if self._fd is None:
+            self._fh.seek(offset)
+            return self._read(n)
+        b = os.pread(self._fd, n, offset)
+        if len(b) != n:
+            # A short pread on a regular file is a truncation, not a retryable
+            # condition; surface it the same way _read does.
             raise EOFError(f"{self.path}: truncated (wanted {n} bytes, got {len(b)})")
         return b
 
@@ -204,8 +234,7 @@ class GGUFReader:
         from .quant import ggml_type_size
 
         nbytes = ggml_type_size(info.type_id, info.n_elements)
-        self._fh.seek(self.data_offset + info.offset)
-        return self._read(nbytes)
+        return self._pread(nbytes, self.data_offset + info.offset)
 
     def tensor(self, name: str):
         """Dequantise one tensor to a float32 numpy array of its row-major shape.
@@ -280,8 +309,7 @@ class GGUFReader:
         if not (0 <= r0 <= r1 <= n_rows):
             raise ValueError(f"row range [{r0},{r1}) outside [0,{n_rows})")
         rb = ggml_type_size(info.type_id, per_row)
-        self._fh.seek(self.data_offset + info.offset + r0 * rb)
-        raw = self._read((r1 - r0) * rb)
+        raw = self._pread((r1 - r0) * rb, self.data_offset + info.offset + r0 * rb)
         shape = (r1 - r0, per_row) if len(info.shape) > 1 else (r1 - r0,)
         return dequantize(raw, info.type_id, shape)
 
@@ -390,6 +418,9 @@ class GGUFReader:
 
     def close(self) -> None:
         self._fh.close()
+        if getattr(self, "_fd", None) is not None:
+            os.close(self._fd)
+            self._fd = None
 
     def __enter__(self) -> "GGUFReader":
         return self

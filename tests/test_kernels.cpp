@@ -133,7 +133,7 @@ static void test_reference_q4k() {
     // d=1, dmin=0 -> w = sc*q exactly, so the numbers are checkable by hand
     const Q4KFixture f = make_q4k(1.0f, 0.0f, sc, mn, quants.data());
     std::vector<float> got(256);
-    dequant_ref(DType::Q4_K, f.bytes.data(), got.data(), 256);
+    dequant_ref(DType::Q4_K, f.bytes.data(), (int64_t)f.bytes.size(), got.data(), 256);
 
     float maxdiff = 0.0f;
     for (int i = 0; i < 256; ++i) {
@@ -147,7 +147,7 @@ static void test_reference_q4k() {
     // with a non-zero dmin the min term must actually subtract
     const Q4KFixture g = make_q4k(1.0f, 1.0f, sc, mn, quants.data());
     std::vector<float> got2(256);
-    dequant_ref(DType::Q4_K, g.bytes.data(), got2.data(), 256);
+    dequant_ref(DType::Q4_K, g.bytes.data(), (int64_t)g.bytes.size(), got2.data(), 256);
     check(std::fabs(got2[0] - g.values[0]) < 1e-4f,
           "a non-zero dmin subtracts the min term");
     check(got2[0] != got[0], "...and changes the result (not a no-op)");
@@ -170,7 +170,7 @@ static void test_fused_matches_reference() {
 
     // reference: dequantise the whole thing, then multiply
     std::vector<float> wf(static_cast<size_t>(n_rows * n_cols));
-    dequant_ref(DType::Q4_K, w.data(), wf.data(), n_rows * n_cols);
+    dequant_ref(DType::Q4_K, w.data(), (int64_t)w.size(), wf.data(), n_rows * n_cols);
 
     std::vector<float> want(static_cast<size_t>(n_rows), 0.0f);
     for (int64_t r = 0; r < n_rows; ++r) {
@@ -266,7 +266,7 @@ static void test_q6k() {
     for (auto& v : x) v = static_cast<float>(rng() % 100) / 50.0f - 1.0f;
 
     std::vector<float> wf(static_cast<size_t>(n_rows * n_cols));
-    dequant_ref(DType::Q6_K, w.data(), wf.data(), n_rows * n_cols);
+    dequant_ref(DType::Q6_K, w.data(), (int64_t)w.size(), wf.data(), n_rows * n_cols);
     std::vector<float> want(static_cast<size_t>(n_rows), 0.0f);
     for (int64_t r = 0; r < n_rows; ++r) {
         float a = 0.0f;

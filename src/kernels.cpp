@@ -257,21 +257,27 @@ int64_t dtype_block_values(DType t) {
 }
 
 // ------------------------------------------------------------------ reference
-void dequant_ref(DType t, const uint8_t* raw, float* out, int64_t n_values) {
+bool dequant_ref(DType t, const uint8_t* raw, int64_t raw_len, float* out,
+                 int64_t n_values) {
     const int64_t bv = dtype_block_values(t);
     const int64_t bb = dtype_block_bytes(t);
+    if (bv <= 0 || bb <= 0) return false;
+    // The kernel is handed a bare pointer and cannot know how big the buffer is.
+    // Without this check a short buffer reads past the end, which is what
+    // segfaulted the test suite. One comparison turns a crash into a refusal.
+    if (raw_len < (n_values / bv) * bb) return false;
     const int64_t nblocks = n_values / bv;
 
     if (t == DType::F32) {
         std::memcpy(out, raw, static_cast<size_t>(n_values) * sizeof(float));
-        return;
+        return true;
     }
     if (t == DType::F16 || t == DType::BF16) {
         const uint16_t* h = reinterpret_cast<const uint16_t*>(raw);
         for (int64_t i = 0; i < n_values; ++i) {
             out[i] = (t == DType::F16) ? f16_to_f32(h[i]) : bf16_to_f32(h[i]);
         }
-        return;
+        return true;
     }
     if (t == DType::Q4_K) {
         for (int64_t b = 0; b < nblocks; ++b) {
@@ -298,7 +304,7 @@ void dequant_ref(DType t, const uint8_t* raw, float* out, int64_t n_values) {
                 col += 32; is += 2;
             }
         }
-        return;
+        return true;
     }
     if (t == DType::IQ4_XS) {
         for (int64_t b = 0; b < nblocks; ++b) {
@@ -320,7 +326,7 @@ void dequant_ref(DType t, const uint8_t* raw, float* out, int64_t n_values) {
                 }
             }
         }
-        return;
+        return true;
     }
     if (t == DType::Q6_K) {
         for (int64_t b = 0; b < nblocks; ++b) {
@@ -352,8 +358,43 @@ void dequant_ref(DType t, const uint8_t* raw, float* out, int64_t n_values) {
                 }
             }
         }
-        return;
+        return true;
     }
+    // No branch matched: this DType has no dequantiser here.
+    return false;
+}
+
+bool dequant_threaded(DType t, const uint8_t* raw, int64_t raw_len, float* out,
+                      int64_t n_values, int threads) {
+    // Blocks are independent and each writes a disjoint output range, so splitting
+    // on block index is race-free and produces bit-identical results to
+    // dequant_ref. F32 is a memcpy (already bandwidth-bound, and the one type whose
+    // blocks are not fixed-size in values) so it stays serial.
+    if (t == DType::F32 || threads <= 1) {
+        return dequant_ref(t, raw, raw_len, out, n_values);
+    }
+    const int64_t bv = dtype_block_values(t);
+    const int64_t bb = dtype_block_bytes(t);
+    if (bv <= 0 || bb <= 0 || raw_len < (n_values / bv) * bb) {
+        return dequant_ref(t, raw, raw_len, out, n_values);
+    }
+    const int64_t nblocks = n_values / bv;
+
+    // F16/BF16 have no sub-structure; a simple strided split is fastest.
+    if (t == DType::F16 || t == DType::BF16) {
+        const uint16_t* h = reinterpret_cast<const uint16_t*>(raw);
+        parallel_for(n_values, threads, [&](int64_t i) {
+            out[i] = (t == DType::F16) ? f16_to_f32(h[i]) : bf16_to_f32(h[i]);
+        });
+        return true;
+    }
+
+    // One whole block per work item keeps the sub-block loops (which share a
+    // scale byte) intact, so nothing is recomputed and nothing is shared.
+    parallel_for(nblocks, threads, [&](int64_t b) {
+        dequant_ref(t, raw + b * bb, bb, out + b * bv, bv);
+    });
+    return true;
 }
 
 // ------------------------------------------------------------------ fusion
@@ -426,7 +467,8 @@ int64_t aero_dtype_block_values(int t) {
 }
 int aero_hardware_threads(void) { return aero::hardware_threads(); }
 
-int aero_dequant_ref(int t, const uint8_t* raw, float* out, int64_t n_values) {
+int aero_dequant_ref(int t, const uint8_t* raw, int64_t raw_len, float* out,
+                     int64_t n_values) {
     switch (static_cast<aero::DType>(t)) {
         case aero::DType::F32:
         case aero::DType::F16:
@@ -434,8 +476,25 @@ int aero_dequant_ref(int t, const uint8_t* raw, float* out, int64_t n_values) {
         case aero::DType::Q6_K:
         case aero::DType::IQ4_XS:
         case aero::DType::BF16:
-            aero::dequant_ref(static_cast<aero::DType>(t), raw, out, n_values);
-            return 1;
+            return aero::dequant_ref(static_cast<aero::DType>(t), raw, raw_len,
+                                     out, n_values) ? 1 : 0;
+        default:
+            return 0;
+    }
+}
+
+// Threaded variant. `threads` is a hint; the kernel clamps to the block count.
+int aero_dequant_threaded(int t, const uint8_t* raw, int64_t raw_len, float* out,
+                          int64_t n_values, int threads) {
+    switch (static_cast<aero::DType>(t)) {
+        case aero::DType::F32:
+        case aero::DType::F16:
+        case aero::DType::Q4_K:
+        case aero::DType::Q6_K:
+        case aero::DType::IQ4_XS:
+        case aero::DType::BF16:
+            return aero::dequant_threaded(static_cast<aero::DType>(t), raw, raw_len,
+                                          out, n_values, threads) ? 1 : 0;
         default:
             return 0;
     }
