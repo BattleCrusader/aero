@@ -19,6 +19,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
 
+from tests._support import LockedOut, load_model, skip_note
+
 from engine import gguf as G          # noqa: E402
 from engine import model as M         # noqa: E402
 from engine import transformer as T   # noqa: E402
@@ -44,7 +46,7 @@ def test_allocation():
     banner("[1] only attention layers get a KV cache")
     with G.GGUFReader(QWEN) as r:
         mc = M.ModelConfig.from_gguf(r)
-        model = M.Model(r)
+        model = load_model(r)
 
         # BEFORE the fix this allocated n_layer slots; now it must allocate
         # exactly len(attn_layers).
@@ -91,9 +93,9 @@ def test_int8():
     banner("[2] int8 KV: size, and the honest precision cost")
     with G.GGUFReader(QWEN) as r:
         mc = M.ModelConfig.from_gguf(r)
-        model = M.Model(r)
+        model = load_model(r)
         f = model.new_state(capacity=16384)
-        model_i8 = M.Model(r, kv_dtype="int8")
+        model_i8 = load_model(r, kv_dtype="int8")
         i = model_i8.new_state(capacity=16384)
         ratio = f.kv.nbytes / i.kv.nbytes
         print(f"       fp32 {f.kv.nbytes/2**20:.1f} MiB -> "
@@ -133,7 +135,7 @@ def test_same_output():
     with G.GGUFReader(QWEN) as r:
         # same model, same prompt, cache allocated both ways. The layer fix is
         # an ALLOCATION change, so the logits must be bit-identical.
-        model = M.Model(r)
+        model = load_model(r)
         st = model.new_state(capacity=32)
         toks = [9707, 11, 1879]
         lg = model.forward(toks, st)
@@ -146,7 +148,7 @@ def test_same_output():
         check(st.kv.len == len(toks), f"cache holds {st.kv.len} positions")
 
         # a second identical run must reproduce exactly (determinism)
-        model2 = M.Model(r)
+        model2 = load_model(r)
         st2 = model2.new_state(capacity=32)
         lg2 = model2.forward(toks, st2)
         check(np.array_equal(lg, lg2), "two runs are bit-identical (deterministic)")
@@ -217,7 +219,7 @@ def test_ring_saving():
         return
     with G.GGUFReader(gp) as r:
         gm = M.ModelConfig.from_gguf(r)
-        model = M.Model(r)
+        model = load_model(r)
         for cap in (4096, 262144):
             st = model.new_state(capacity=cap)
             kv = st.kv
@@ -255,7 +257,7 @@ def test_int4():
     import os as _os
     with G.GGUFReader(QWEN) as r:
         mc = M.ModelConfig.from_gguf(r)
-        model = M.Model(r, kv_dtype="int4")
+        model = load_model(r, kv_dtype="int4")
         st = model.new_state(capacity=262144)
         gib = st.kv.nbytes / 2**30
         print(f"       int4 @ 262144: {gib:.2f} GiB")
@@ -267,7 +269,7 @@ def test_int4():
         check(st.kv.k[0].dtype == np.uint8, "packed storage is uint8")
 
         # int4 must be ~half of int8, and ~1/8 of fp32 at the same capacity
-        i8 = M.Model(r, kv_dtype="int8").new_state(capacity=262144)
+        i8 = load_model(r, kv_dtype="int8").new_state(capacity=262144)
         print(f"       int8 @ 262144: {i8.kv.nbytes/2**30:.2f} GiB")
         ratio = i8.kv.nbytes / st.kv.nbytes
         check(1.8 < ratio < 2.2, f"int4 is ~2x smaller than int8 ({ratio:.2f}x)")
@@ -318,7 +320,7 @@ def test_int4_tokens():
     toks = {}
     for d in ("fp32", "int8", "int4"):
         with G.GGUFReader(QWEN) as r:
-            m = M.Model(r, kv_dtype=d)
+            m = load_model(r, kv_dtype=d)
             st = m.new_state(capacity=64)
             lg = m.forward(prompt, st)
             seq = [int(np.argmax(lg))]
@@ -421,7 +423,7 @@ def test_per_layer_heads():
         check(gm.kv_heads_at(gl[0]) != gm.kv_heads_at(wl[0]),
               "the head count really does vary by layer (not a uniform file)")
 
-        model = M.Model(r)
+        model = load_model(r)
         st = model.new_state(capacity=65536)
         kv = st.kv
         got = [kv.heads[i] for i in gm.attn_layers]
@@ -455,7 +457,7 @@ def test_per_layer_heads():
             check(True, "writing the wrong head count raises, not silently")
 
         # the combined stack must be small enough to be usable
-        i4 = M.Model(r, kv_dtype="int4").new_state(capacity=262144)
+        i4 = load_model(r, kv_dtype="int4").new_state(capacity=262144)
         gib = i4.kv.nbytes / 2**30
         print(f"       ctx 262144, int4 + per-layer + ring: {gib:.2f} GiB")
         check(gib < 2.0, f"gemma4 at 256k fits under 2 GiB ({gib:.2f})")
@@ -463,7 +465,45 @@ def test_per_layer_heads():
               f"{len(wl)} windowed layers are rings")
 
 
+
+def _locked_out() -> bool:
+    """True when another aero process holds the model-load lock.
+
+    The lock is deliberate: two concurrent model loads OOMed a 16 GB host. But a
+    test that CRASHES on it is indistinguishable from one that fails, and a suite
+    that silently does not run looks exactly like one that passed. So the refusal is
+    detected and reported as a SKIP, and the suite exits 0 with a clear note.
+    """
+    try:
+        import fcntl, os, tempfile
+        path = os.path.join(tempfile.gettempdir(), "aero-model-load.lock")
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return False
+        except OSError:
+            return True
+    finally:
+        try:
+            os.close(fd)
+        except Exception:
+            pass
+
+
 def main():
+    try:
+        return _run()
+    except LockedOut:
+        print(skip_note())
+        return 0
+
+
+def _run():
+    if _locked_out():
+        print("\n=== SKIPPED: another aero process holds the model-load lock "
+              "(one load at a time is deliberate) ===")
+        return 0
     print("=== KV cache: allocation fix + int8 option ===")
     test_allocation()
     test_int8()

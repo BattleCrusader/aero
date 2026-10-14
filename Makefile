@@ -20,7 +20,7 @@ PYTESTS := $(wildcard tests/test_*.py)
 .PHONY: all test test-cpp test-engine test-server test-wrappers demo probe \
         check-py kernels guard engine-cpp clean
 
-all: $(BUILD)/test_memory_guard $(BUILD)/test_metal_guard $(BUILD)/aero-load-demo $(BUILD)/aero-bwprobe $(BUILD)/test_kernels $(BUILD)/test_tensor $(KLIB)
+all: $(BUILD)/test_memory_guard $(BUILD)/test_metal_guard $(BUILD)/aero-load-demo $(BUILD)/aero-bwprobe $(BUILD)/test_kernels $(BUILD)/test_tensor $(BUILD)/test_gguf $(KLIB)
 
 # ---- native kernels ----
 # The test binary links the kernel TU directly, so `make test-cpp` proves the
@@ -44,8 +44,23 @@ $(BUILD)/test_tensor: $(TSRC) tests/test_tensor.cpp $(THDR)
 	@mkdir -p $(BUILD)
 	$(CXX) -std=c++17 $(CXXFLAGS) $(TSRC) tests/test_tensor.cpp -o $@ -pthread
 
-engine-cpp: $(BUILD)/test_tensor
+# gguf reader. Needs kernels.cpp too: it dequantises and matvecs through the fused
+# kernels, and the test proves that path works on a real file.
+GSRC := src/gguf.cpp
+GHDR := include/aero/gguf.hpp
+MODEL_DIR ?= $(HOME)/.cache/aero-models
+REAL_MODEL ?= $(MODEL_DIR)/Qwen3.8-4B-Q4_K_M.gguf
+
+$(BUILD)/test_gguf: $(GSRC) $(KSRC) tests/test_gguf_cpp.cpp $(GHDR) $(KHDR)
+	@mkdir -p $(BUILD)
+	$(CXX) -std=c++17 $(CXXFLAGS) $(GSRC) $(KSRC) tests/test_gguf_cpp.cpp -o $@ -pthread
+
+engine-cpp: $(BUILD)/test_tensor $(BUILD)/test_gguf
 	@./$(BUILD)/test_tensor
+	@echo
+	@if [ -f "$(REAL_MODEL)" ]; then \
+		AERO_MAX_RAM=$${AERO_MAX_RAM:-5G} ./$(BUILD)/test_gguf "$(REAL_MODEL)"; \
+	 else echo "gguf test: SKIPPED (no $(REAL_MODEL))"; fi
 
 # The memory guard as a shared library, so Python arms the SAME guard the C++
 # tests exercise. A reimplementation in Python would be a second thing to keep
@@ -99,6 +114,10 @@ test-cpp: all
 	@./$(BUILD)/test_kernels
 	@echo
 	@./$(BUILD)/test_tensor
+	@echo
+	@if [ -f "$(REAL_MODEL)" ]; then \
+		AERO_MAX_RAM=$${AERO_MAX_RAM:-5G} ./$(BUILD)/test_gguf "$(REAL_MODEL)"; \
+	 else echo "gguf test: SKIPPED (no $(REAL_MODEL))"; fi
 
 test-engine: check-py
 	@if [ -x "$(PY)" ]; then $(PY) tests/test_engine.py; \

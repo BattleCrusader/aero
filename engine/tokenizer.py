@@ -78,7 +78,8 @@ class Tokenizer:
                  eos_id: Optional[int] = None, bos_id: Optional[int] = None,
                  pad_id: Optional[int] = None,
                  vocab_type: str = "gpt2",
-                 add_space_prefix: bool = False) -> None:
+                 add_space_prefix: bool = False,
+                 add_bos: bool = False) -> None:
         if not tokens:
             raise ValueError("empty vocabulary")
         # TWO VOCAB FAMILIES. "gpt2" is byte-level BPE: bytes are remapped to
@@ -91,6 +92,15 @@ class Tokenizer:
             raise ValueError(f"unknown vocab_type {vocab_type!r}")
         self.vocab_type = vocab_type
         self.add_space_prefix = bool(add_space_prefix)
+        # BOS: gemma declares `tokenizer.ggml.add_bos_token = true` and every
+        # reference implementation (llama.cpp, transformers) prepends
+        # `<bos>` before the prompt. Dropping it is not a cosmetic difference:
+        # gemma is trained with a leading BOS, so the first token at position 0
+        # sits off-distribution and the whole residual stream degrades into the
+        # degenerate byte-token prior. Measured on gemma-4-12b-it-IQ4_XS:
+        # 'The capital of France is' -> '-1-1....' without BOS, but
+        # [' a', ' not', ' France', ' Europe', ' England', ' Russia'] with it.
+        self.add_bos = bool(add_bos) and bos_id is not None
         self.tokens = list(tokens)
         self.n_vocab = len(self.tokens)
         self.token_types = list(token_types) if token_types else None
@@ -156,9 +166,19 @@ class Tokenizer:
         return word
 
     # ---- public API -----------------------------------------------------
-    def encode(self, text: str) -> List[int]:
-        """text -> token ids. Special tokens in the input are matched whole."""
+    def encode(self, text: str, add_bos: Optional[bool] = None) -> List[int]:
+        """text -> token ids. Special tokens in the input are matched whole.
+
+        Prepends a leading `<bos>` when the file asks for one
+        (`tokenizer.ggml.add_bos_token`), which is what llama.cpp's
+        `llama_tokenize(..., add_special=true)` does for gemma. Pass
+        add_bos=False to suppress it (e.g. when a chat template already carries
+        its own framing).
+        """
         ids: List[int] = []
+        want_bos = self.add_bos if add_bos is None else bool(add_bos)
+        if want_bos and self.bos_id is not None:
+            ids.append(int(self.bos_id))
         if not text:
             return ids
 
@@ -271,4 +291,7 @@ class Tokenizer:
             pad_id=kv.get("tokenizer.ggml.padding_token_id"),
             vocab_type=vtype,
             add_space_prefix=bool(kv.get("tokenizer.ggml.add_space_prefix", False)),
+            # gemma sets this true; qwen sets it false. The flag is IN the file,
+            # so it is read rather than inferred from the architecture.
+            add_bos=bool(kv.get("tokenizer.ggml.add_bos_token", False)),
         )

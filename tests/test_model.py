@@ -21,6 +21,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 sys.path.insert(0, ROOT)
 
+from tests._support import LockedOut, load_model, skip_note
+
 from engine import gguf as G  # noqa: E402
 from engine import model as M  # noqa: E402
 from engine import transformer as T  # noqa: E402
@@ -125,7 +127,14 @@ def main() -> int:
 
             # ------------------------------------------ 3. state allocation
             print("\n[3] state allocation")
-            model = M.Model(r)
+            try:
+                model = load_model(r)
+            except RuntimeError as e:
+                if "already holds the model-load lock" in str(e):
+                    print("\n=== SKIPPED: another aero process holds the "
+                          "model-load lock (one load at a time is deliberate) ===")
+                    return 0
+                raise
             st = model.new_state(capacity=64)
             check(st.kv is not None, "KV cache allocated (attention layers exist)")
             check(st.kv.capacity == 64, "KV capacity is honoured (footprint known up front)")
@@ -144,7 +153,13 @@ def main() -> int:
         print("       (skipped: model not present)")
     else:
         with G.GGUFReader(REAL) as r:
-            model = M.Model(r)
+            try:
+                model = load_model(r)
+            except RuntimeError as e:
+                if "already holds the model-load lock" in str(e):
+                    print("       (skipped: model-load lock held by another process)")
+                    return 0
+                raise
             st = model.new_state(capacity=32)
             toks = [9707]        # "Hello" in many BPE vocabs; any id works
             t0 = time.time()
