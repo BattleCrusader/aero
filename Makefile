@@ -138,6 +138,7 @@ test-model: check-py
 		AERO_SKIP_SLOW=1 $(PY) -W error::RuntimeWarning tests/test_kv.py 2>&1 | tail -25; echo; \
 		AERO_SKIP_SLOW=1 $(PY) -W error::RuntimeWarning tests/test_prerope.py 2>&1 | tail -20; echo; \
 		$(PY) -W error::RuntimeWarning tests/test_tokenizer.py 2>&1 | tail -30; echo; \
+		$(PY) -W error::RuntimeWarning tests/test_chat_template.py 2>&1 | tail -12; echo; \
 		$(PY) -W error::RuntimeWarning tests/test_native.py 2>&1 | tail -25; echo; \
 		AERO_SKIP_SLOW=1 $(PY) -W error::RuntimeWarning tests/test_coherence.py 2>&1 | tail -20; \
 		$(PY) tests/test_arch.py 2>&1 | tail -30; echo; \

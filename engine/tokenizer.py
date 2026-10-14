@@ -178,7 +178,14 @@ class Tokenizer:
         ids: List[int] = []
         want_bos = self.add_bos if add_bos is None else bool(add_bos)
         if want_bos and self.bos_id is not None:
-            ids.append(int(self.bos_id))
+            # Do not double it: chat templates emit <bos> themselves (gemma4's
+            # template opens with {{- bos_token -}}), and the literal then matches
+            # as a special token below. Prepending again would put two BOS at
+            # position 0 and 1, which is just as off-distribution as having none.
+            bos_str = (self.tokens[self.bos_id]
+                       if 0 <= self.bos_id < len(self.tokens) else None)
+            if bos_str is None or not text.startswith(bos_str):
+                ids.append(int(self.bos_id))
         if not text:
             return ids
 

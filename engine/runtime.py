@@ -19,6 +19,11 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Dict, Iterator, List, Optional, Tuple
 
+try:                        # imported as engine.runtime (usual)
+    from .chat_template import render_chat
+except ImportError:        # pragma: no cover - run as a plain script
+    from engine.chat_template import render_chat
+
 
 @dataclass
 class GenParams:
@@ -245,32 +250,24 @@ class GgufRuntime(ModelRuntime):
         return dict(self._load_stats)
 
     # ---- tokenization ---------------------------------------------------
-    def apply_chat_template(self, messages: List[Dict[str, str]]) -> str:
-        """ChatML framing, matching the file's own Jinja template.
+    def apply_chat_template(self, messages: List[Dict[str, str]],
+                            add_generation_prompt: bool = True,
+                            enable_thinking: Optional[bool] = None) -> str:
+        """Render the conversation the way the file's OWN chat template does.
 
-        The GGUF ships a full Jinja chat_template; rendering it needs a Jinja
-        engine, so the structural part is implemented directly, using the file's
-        special tokens rather than hard-coded strings.
+        Delegates to engine.chat_template so the runtime and the check tools cannot
+        drift apart -- a tool that renders its own prompt "verifies" something the
+        engine never actually sends, which is precisely how the BOS bug stayed
+        hidden.
 
-        The important detail: after '<|im_start|>assistant\\n' this model expects a
-        THINKING BLOCK (' thinking\\n' for thinking-enabled, or
-        ' thinking\\n\\n</think>\\n\\n' for disabled). Omitting it makes the model
-        emit newline-only continuations, which looks like a broken engine.
+        The returned text already contains the leading BOS where the template emits
+        one, so it is tokenized with add_bos=False. (Tokenizer.encode also refuses
+        to double it.)
         """
-        t = self.tokenizer
-        im_start = "<|im_start|>" if (t and "<|im_start|>" in t._special) else ""
-        im_end = "<|im_end|>" if (t and "<|im_end|>" in t._special) else ""
-        out = []
-        for m in messages:
-            role = m.get("role", "user")
-            out.append(f"{im_start}{role}\n{m.get('content','')}{im_end}\n")
-        # generation prompt: assistant turn + thinking block
-        out.append(f"{im_start}assistant\n")
-        if os.environ.get("AERO_THINKING", "1") == "0":
-            out.append(" thinking\n\n</think>\n\n")
-        else:
-            out.append(" thinking\n")
-        return "".join(out)
+        return render_chat(messages, self.tokenizer,
+                           add_generation_prompt=add_generation_prompt,
+                           enable_thinking=enable_thinking)
+
 
     def tokenize(self, text: str) -> List[int]:
         """Real BPE tokenization, from the vocab in the file."""
