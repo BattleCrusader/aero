@@ -232,16 +232,59 @@ bool attention_layer(const AttentionLayerArgs& a, float* out) {
                          a.T, H, HK, D, DV, scale, a.qpos, nullptr, n_kv, a.window,
                          1024))
         return false;
+    // WHERE the non-finite comes from: `att` is the attention output BEFORE the o-projection,
+    // so a NaN here is the softmax/mask (scores all -inf -> 0/0) and a finite att with a NaN
+    // after proj would be the projection. Silent unless AERO_HOOK_DEBUG is set.
+    if (std::getenv("AERO_HOOK_DEBUG")) {
+        int bad_att = -1, bad_k = -1, bad_v = -1;
+        for (int64_t i = 0; i < a.T * HD; ++i)
+            if (!std::isfinite(att[(size_t)i])) { bad_att = (int)i; break; }
+        for (int64_t i = 0; i < n_kv * HK * D; ++i)
+            if (!std::isfinite(k_all[(size_t)i])) { bad_k = (int)i; break; }
+        for (int64_t i = 0; i < n_kv * HK * DV; ++i)
+            if (!std::isfinite(v_all[(size_t)i])) { bad_v = (int)i; break; }
+        if (bad_att >= 0 || bad_k >= 0 || bad_v >= 0)
+            std::fprintf(stderr,
+                "ATTN T=%d n_kv=%lld: att bad@%d  k_all bad@%d  v_all bad@%d\n",
+                (int)a.T, (long long)n_kv, bad_att, bad_k, bad_v);
+    }
+
 
     // ---- 7. gate (python's default branch: SIGMOID) ------------------------
+    if (std::getenv("AERO_HOOK_DEBUG")) {
+        int bg = -1;
+        for (size_t i = 0; i < gate_in.size(); ++i)
+            if (!std::isfinite(gate_in[i])) { bg = (int)i; break; }
+        std::fprintf(stderr, "ATTN T=%d: gate_in non-finite@%d of %zu\n",
+                     (int)a.T, bg, gate_in.size());
+    }
     if (a.has_gate)
         for (size_t i = 0; i < gate_in.size(); ++i)
             att[i] *= 1.0f / (1.0f + std::exp(-gate_in[i]));
 
     // ---- 8. output projection ----------------------------------------------
     // cols = HD: the o projection maps the attention width, not n_embd.
-    if (!proj(a.o_dt, a.o_w, a.o_rows, a.T * HD, att.data(), out))
+    if (std::getenv("AERO_HOOK_DEBUG")) {
+        int ba = -1;
+        for (int64_t i = 0; i < a.T * HD; ++i)
+            if (!std::isfinite(att[(size_t)i])) { ba = (int)i; break; }
+        std::fprintf(stderr, "ATTN T=%d: att-after-gate non-finite@%d of %lld (HD=%lld)\n",
+                     (int)a.T, ba, (long long)(a.T * HD), (long long)HD);
+    }
+    // cols = HD, NOT a.T * HD: `cols` is the projection's INPUT width, and the o-projection
+    // maps HD -> n_embd. Passing T*HD read a 4096-column weight as 20480 columns --
+    // out of bounds, which is where the prefill's NaN came from (finite gate_in, finite
+    // att-after-gate, non-finite out). proj infers T from the input buffer size.
+    if (!proj(a.o_dt, a.o_w, a.o_rows, HD, att.data(), out))
         return false;
+    if (std::getenv("AERO_HOOK_DEBUG")) {
+        int bo = -1;
+        for (int64_t i = 0; i < a.T * a.n_embd; ++i)
+            if (!std::isfinite(out[i])) { bo = (int)i; break; }
+        if (bo >= 0)
+            std::fprintf(stderr, "ATTN T=%d: OUT non-finite@%d of %lld (o_rows=%lld)\n",
+                         (int)a.T, bo, (long long)(a.T * a.n_embd), (long long)a.o_rows);
+    }
     return true;
 }
 
