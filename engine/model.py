@@ -774,7 +774,7 @@ class Model:
 # ------------------------------------------------------------- the plan
 
 def plan_footprint(reader, context: int, block_rows: int = 64,
-                   kv_dtype: str = "fp32") -> dict:
+                   kv_dtype: str = "fp32", native: bool = False) -> dict:
     """Predict the peak footprint BEFORE any weight data is read.
 
     The tensor index gives every tensor's size, so the plan needs only the
@@ -839,7 +839,32 @@ def plan_footprint(reader, context: int, block_rows: int = 64,
     state = kv_bytes + ssm_bytes + moe_bytes
     total = weights + state + scratch
 
+    # THE NATIVE READ PATH CHANGES THE ANSWER -- but not by adding the file size.
+    #
+    # The per-layer model above describes the Python path (weights read a layer at a
+    # time and released). The C++ engine instead mmaps the whole file and reads every
+    # projection out of the mapping, so `mapped_file_bytes` is reported. It is NOT
+    # added to the total, and the first version of this code that DID add it was wrong:
+    # it put gemma-4-12b at 11,388 MiB and would have refused a model that demonstrably
+    # runs under a 5 GiB cap (it produces 'The capital of France is **Paris**.'
+    # through this engine). Mapped file pages are PURGEABLE -- macOS evicts them under
+    # pressure instead of OOMing -- whereas the ceiling exists to bound ANONYMOUS
+    # demand (state, scratch, activations). What the mapping does add is a transient
+    # working set of roughly one layer, which is what the native path is charged
+    # instead of the full per-layer weight term.
+    mapped = 0
+    if native:
+        try:
+            import os as _os
+            mapped = int(_os.path.getsize(reader.path))
+        except Exception:                          # noqa: BLE001
+            mapped = 0
+        native_work = max(largest, emb_bytes) + head_bytes
+        total = native_work + state + scratch
+
     return {
+        "mapped_file_bytes": mapped,
+        "native": bool(native),
         "arch": cfg.arch,
         "n_layer": cfg.n_layer,
         "embeddings_bytes": emb_bytes,

@@ -20,7 +20,7 @@ PYTESTS := $(wildcard tests/test_*.py)
 .PHONY: all test test-cpp test-engine test-server test-wrappers demo probe test-cached test-cache-status \
         test-cache-clear check-py kernels guard engine-cpp clean
 
-all: $(BUILD)/test_memory_guard $(BUILD)/test_metal_guard $(BUILD)/aero-load-demo $(BUILD)/aero-bwprobe $(BUILD)/test_kernels $(BUILD)/test_tensor $(BUILD)/test_ssm_cpp $(BUILD)/test_gguf $(BUILD)/test_transformer $(KLIB) $(SLIB) $(XLIB) $(TLIB) $(MLIB) $(KVLIB) $(BUILD)/test_model_cpp $(ATTLIB)
+all: $(BUILD)/test_memory_guard $(BUILD)/test_metal_guard $(BUILD)/aero-load-demo $(BUILD)/aero-bwprobe $(BUILD)/test_kernels $(BUILD)/test_tensor $(BUILD)/test_ssm_cpp $(BUILD)/test_gguf $(BUILD)/test_transformer $(KLIB) $(SLIB) $(XLIB) $(TLIB) $(MLIB) $(KVLIB) $(BUILD)/test_model_cpp $(ATTLIB) $(BUILD)/test_moe_cpp
 
 # ---- native kernels ----
 # The test binary links the kernel TU directly, so `make test-cpp` proves the
@@ -101,6 +101,14 @@ $(SLIB): $(SSMSRC) $(SSMHDR)
 $(BUILD)/test_ssm_cpp: $(SSMSRC) tests/test_ssm_cpp.cpp $(SSMHDR)
 	@mkdir -p $(BUILD)
 	$(CXX) -std=c++17 $(CXXFLAGS) $(SSMSRC) tests/test_ssm_cpp.cpp -o $@ -pthread
+
+$(BUILD)/test_moe_cpp: src/moe.cpp tests/test_moe_cpp.cpp $(SSMHDR)
+	@mkdir -p $(BUILD)
+	$(CXX) -std=c++17 $(CXXFLAGS) src/moe.cpp tests/test_moe_cpp.cpp -o $@ -pthread
+
+moe-cpp: $(BUILD)/test_moe_cpp
+	@./$(BUILD)/test_moe_cpp
+
 
 ssm: $(SLIB)
 	@echo "ssm/moe kernels: $(SLIB)"
@@ -221,6 +229,8 @@ test-cpp: all
 	@echo
 	@./$(BUILD)/test_ssm_cpp
 	@echo
+	@./$(BUILD)/test_moe_cpp
+	@echo
 	@./$(BUILD)/test_transformer
 	@echo
 	@./$(BUILD)/test_model_cpp
@@ -254,6 +264,7 @@ test-model: check-py
 		$(PY) -W error::RuntimeWarning tests/test_ssm_native_q.py 2>&1 | tail -12; echo; \
 		$(PY) -W error::RuntimeWarning tests/test_ssm_hook.py 2>&1 | tail -10; echo; \
 		$(PY) -W error::RuntimeWarning tests/test_hook_guard.py 2>&1 | tail -8; echo; \
+		$(PY) -W error::RuntimeWarning tests/test_plan_footprint.py 2>&1 | tail -8; echo; \
 		$(PY) -W error::RuntimeWarning tests/test_model.py; echo; \
 		AERO_SKIP_SLOW=1 $(PY) -W error::RuntimeWarning tests/test_kv.py 2>&1 | tail -25; echo; \
 		AERO_SKIP_SLOW=1 $(PY) -W error::RuntimeWarning tests/test_prerope.py 2>&1 | tail -20; echo; \

@@ -191,8 +191,12 @@ class GgufRuntime(ModelRuntime):
         probe = GGUFReader(path)
         arch = probe.arch()
         ARCH.spec_for(arch)                    # refuse unknown arches here, early
+        # native=: the C++ engine mmaps the file, so its footprint can approach the
+        # file size, while the Python reference streams per layer. Planning for the
+        # wrong one under-predicts by (file - one layer) -- 6.4 GB on gemma-4-12b.
         plan = plan_footprint(probe, self.context, self.block_rows,
-                              kv_dtype=self.kv_dtype)
+                              kv_dtype=self.kv_dtype,
+                              native=os.environ.get("AERO_NATIVE_LOOP", "1") == "1")
         probe.close()
 
         if budget is not None and plan["total_bytes"] > budget:
