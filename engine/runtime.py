@@ -20,6 +20,8 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Dict, Iterator, List, Optional, Tuple
 
+from .devices import DevicePlan
+
 try:                        # imported as engine.runtime (usual)
     from .chat_template import render_chat
 except ImportError:        # pragma: no cover - run as a plain script
@@ -152,10 +154,25 @@ class GgufRuntime(ModelRuntime):
     def __init__(self, max_ram: Optional[str] = None, block_rows: int = 64,
                  threads: Optional[int] = None, context: int = 4096,
                  kv_dtype: str = "fp32", k_dtype: Optional[str] = None,
-                 v_dtype: Optional[str] = None) -> None:
+                 v_dtype: Optional[str] = None,
+                 device_plan: Optional[DevicePlan] = None) -> None:
         self.max_ram = max_ram
         self.block_rows = block_rows
+        self.device_plan = device_plan
+        # THE DEVICE FLAGS LAND HERE. --use-cpu is the only flag the C++ block loop
+        # can act on, and it arrives as this thread count:
+        #   runtime.threads -> aero_geom.threads -> aero::matmul(W, Xm, Ym, g_.threads)
+        # An explicit count is honoured exactly; left at the default (cpu=0) the loop
+        # gets the machine's hardware thread count. It used to collapse to 1 through
+        # `rt.threads or 1`, so the flag changed nothing and 7 of 8 cores sat idle.
+        # Without a plan (existing callers) it stays None -- unchanged behaviour.
         self.threads = threads
+        self.device_notice = None
+        if self.threads is None and device_plan is not None:
+            from .native import hardware_threads
+            self.threads = device_plan.thread_budget(hardware_threads())
+        if device_plan is not None:
+            self.device_notice = device_plan.notice()
         self.context = context
         self.kv_dtype = kv_dtype
         self.k_dtype = k_dtype or kv_dtype
@@ -274,6 +291,8 @@ class GgufRuntime(ModelRuntime):
 
         self._load_stats = {
             "arch": arch,
+            "threads": self.threads,
+            "device_notice": self.device_notice,
             "layers": self.model.cfg.n_layer,
             "budget_bytes": budget,
             "planned_bytes": plan["total_bytes"],
@@ -478,6 +497,20 @@ RUNTIMES: Dict[str, type] = {
     "echo": EchoRuntime,
     "gguf": GgufRuntime,
 }
+
+
+def accepts_kwarg(name: str, key: str) -> bool:
+    """Whether runtime `name` accepts constructor kwarg `key`.
+
+    The stubs have bare constructors, so a caller that has a device plan to hand over
+    must ask first -- make_runtime() refuses unknown kwargs rather than dropping them
+    silently, which is right, but it would turn `aero-chat --runtime echo` into a
+    Traceback if callers just passed the plan unconditionally.
+    """
+    if name not in RUNTIMES:
+        raise ValueError(f"unknown runtime {name!r}; available: {sorted(RUNTIMES)}")
+    import inspect
+    return key in inspect.signature(RUNTIMES[name].__init__).parameters
 
 
 def make_runtime(name: str, **kwargs) -> ModelRuntime:

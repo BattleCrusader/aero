@@ -22,7 +22,7 @@ import urllib.request
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from engine import Device, build_engine, format_limits  # noqa: E402
-from engine.runtime import GenParams, make_runtime  # noqa: E402
+from engine.runtime import GenParams, accepts_kwarg, make_runtime  # noqa: E402
 
 BANNER = r"""
    _   ___ ___  ___
@@ -171,12 +171,19 @@ def main(argv=None) -> int:
         print(f"error: {e}", file=sys.stderr)
         return 2
     devices = str(engine.plan)
+    if engine.plan.notice():
+        print(f"note: {engine.plan.notice()}")
 
     runtime = None
     if not args.server:
         # Options the real runtime needs; make_runtime() keeps its no-arg
         # signature for the echo stub, so they are applied only when accepted.
         opts = {}
+        # THE PLAN GOES WITH THE RUNTIME, or the flags die here. --use-cpu reaches
+        # compute as runtime.threads -> aero_geom.threads -> aero::matmul, and an
+        # unspecified count means "use the machine's cores", not "use one".
+        if accepts_kwarg(args.runtime, "device_plan"):
+            opts["device_plan"] = engine.plan
         for key in ("max_ram", "context", "block_rows"):
             if hasattr(args, key) and getattr(args, key) is not None:
                 opts[key] = getattr(args, key)

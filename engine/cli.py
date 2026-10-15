@@ -142,6 +142,12 @@ def main(argv=None) -> int:
 
     plan = eng.plan
     print(f"allocation: {plan}  ({plan.total_streams} stream(s))")
+    # A flag that is accepted and ignored is worse than one that errors: it makes the
+    # user believe they changed something. A device in the plan with no kernel behind
+    # it is therefore said out loud, immediately, not left to be inferred.
+    _note = plan.notice()
+    if _note:
+        print(f"note: {_note}")
 
     cap = None
     if args.max_ram:

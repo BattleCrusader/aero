@@ -260,7 +260,7 @@ def main(argv=None) -> int:
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
     from . import build_engine, format_limits
-    from .runtime import make_runtime
+    from .runtime import accepts_kwarg, make_runtime
 
     p = argparse.ArgumentParser(prog="aero-serve",
                                 description="OpenAI-compatible server for Aero.")
@@ -292,8 +292,15 @@ def main(argv=None) -> int:
     # drive compute yet: no Metal/ANE kernel exists behind the C++ loop, and
     # multi-device splitting was measured SLOWER -- 0.56x CPU+GPU, 0.89x GPU+ANE --
     # so a split here would be a regression, not a feature.)
-    if a.use_cpu is not None:
-        runtime.threads = max(1, int(a.use_cpu))
+    # ONE source of truth: the plan decides, and it also decides the DEFAULT. The
+    # old form only acted when --use-cpu was given explicitly, so the default left
+    # `rt.threads or 1` = 1 thread on an 8-core box while `gpu=1` -- which has no
+    # kernel behind it -- was reported as a stream.
+    if accepts_kwarg(a.runtime, "device_plan"):
+        runtime = make_runtime(a.runtime, device_plan=engine.plan)
+    note = engine.plan.notice()
+    if note:
+        print(f"note: {note}")
     try:
         runtime.load(a.model)
     except NotImplementedError as e:

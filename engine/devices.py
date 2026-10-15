@@ -63,6 +63,14 @@ ALL_DEVICES = (Device.CPU, Device.GPU, Device.ANE)
 #: Per-flag defaults. gpu=1 is the project default; the others are opt-in.
 DEFAULT_COUNTS: Dict[str, int] = {"cpu": 0, "gpu": 1, "ane": 0}
 
+#: Devices the blocked matmul can ACTUALLY compute on. The C++ block loop
+#: (aero::matmul) is CPU-only -- there is no Metal or ANE kernel behind it -- so a GPU
+#: or ANE count is a RECORDED request, never a silent compute stream. Splitting layers
+#: across units was measured SLOWER on this machine (CPU+GPU 0.56x, GPU+ANE 0.89x;
+#: bus-limited, not unit-limited), so wiring a split would be a regression dressed as
+#: a feature.
+COMPUTE_CAPABLE: Tuple[Device, ...] = (Device.CPU,)
+
 
 class NoDevicesSelected(ValueError):
     """Every device count was zero -- nothing to run on."""
@@ -105,6 +113,48 @@ class DevicePlan:
         """Fraction of the work this device should be given, by stream count."""
         t = self.total_streams
         return (self.count(device) / t) if t else 0.0
+
+    @property
+    def compute_streams(self) -> int:
+        """Streams that can actually compute -- see COMPUTE_CAPABLE."""
+        return sum(n for d, n in self.counts if d in COMPUTE_CAPABLE)
+
+    def recorded_only(self) -> Tuple[Tuple[Device, int], ...]:
+        """Plan entries with no compute kernel behind them, in plan order."""
+        return tuple((d, n) for d, n in self.counts if d not in COMPUTE_CAPABLE)
+
+    def notice(self) -> Optional[str]:
+        """One line naming what is recorded but cannot compute; None when clean.
+
+        A flag that is accepted and ignored is worse than one that errors: it makes
+        the user believe they changed something. So the truth is stated, not implied.
+        """
+        ro = self.recorded_only()
+        if not ro:
+            return None
+        asked = ", ".join(f"--use-{d.value}={n}" for d, n in ro)
+        names = "/".join(d.value.upper() for d, _ in ro)
+        # The CPU clause must never read as zero: with the default plan (cpu=0) there
+        # are no CPU *streams* but the block loop still computes, on the hardware
+        # thread count. "Compute runs on 0 CPU stream(s)" was the same class of
+        # misleading statement this notice exists to prevent.
+        where = (f"compute runs on {self.compute_streams} CPU stream(s)"
+                 if self.compute_streams else
+                 "compute runs on the CPU block loop")
+        return (f"{asked} is recorded but not driving compute: the block loop has no "
+                f"{names} kernel (cross-unit splitting measured 0.56x-0.89x here). "
+                f"{where}.")
+
+    def thread_budget(self, hardware: int) -> int:
+        """Threads the C++ block loop should get.
+
+        An explicit --use-cpu=N is honoured exactly. Left at the default of 0, the
+        loop gets the machine's hardware thread count: the CPU count is the only flag
+        the compute path can act on, so collapsing it to 1 (which `rt.threads or 1`
+        did) made the flag meaningless and left every core but one idle.
+        """
+        n = self.count(Device.CPU)
+        return n if n > 0 else max(1, int(hardware))
 
     def __str__(self) -> str:
         return "+".join(f"{d.value}={n}" for d, n in self.counts)
