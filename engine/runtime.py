@@ -234,6 +234,7 @@ class GgufRuntime(ModelRuntime):
         # cap is enforced when nothing is measuring.
         self.guard = _make_guard(budget)
 
+        self.path = path                              # the native tokenizer opens the file itself
         self._reader = GGUFReader(path)
         self._arch = arch
         self.model = Model(self._reader, block_rows=self.block_rows,
@@ -279,15 +280,30 @@ class GgufRuntime(ModelRuntime):
             self._load_stats["native_block_loop"] = False
             self._load_stats["native_block_loop_error"] = "disabled by AERO_NATIVE_LOOP=0"
 
-        # the tokenizer is what turns ids into text; without it the runtime can
-        # only report numbers, so load it and say clearly if it is absent.
+        # THE PROMPT PATH IS C++. The tokenizer and the chat renderer come from
+        # libaero_tokenizer/libaero_chat; engine/tokenizer.py and engine/chat_template.py
+        # are the ORACLES the tests compare against, not the implementation. Python is
+        # the fallback only when the libraries are absent or AERO_NATIVE_PROMPT=0, and
+        # which one is in use is recorded -- never silent.
         tok_err = None
+        self.token_source = "native"
+        if os.environ.get("AERO_NATIVE_PROMPT", "1") == "0":
+            self.token_source = "python (AERO_NATIVE_PROMPT=0)"
         try:
-            from .tokenizer import Tokenizer
-            self.tokenizer = Tokenizer.from_gguf(self._reader)
-        except Exception as e:
-            self.tokenizer = None
-            tok_err = f"{type(e).__name__}: {e}"
+            if self.token_source == "native":
+                from .native_prompt import NativeTokenizer
+                self.tokenizer = NativeTokenizer(self.path)
+            else:
+                from .tokenizer import Tokenizer
+                self.tokenizer = Tokenizer.from_gguf(self._reader)
+        except Exception as e:                      # missing lib, refused file...
+            self.token_source = "python (%s: %s)" % (type(e).__name__, e)
+            try:
+                from .tokenizer import Tokenizer
+                self.tokenizer = Tokenizer.from_gguf(self._reader)
+            except Exception as e2:
+                self.tokenizer = None
+                tok_err = f"{type(e2).__name__}: {e2}"
 
         self._load_stats = {
             "arch": arch,
@@ -303,6 +319,7 @@ class GgufRuntime(ModelRuntime):
             "kv_bytes": self.state.kv.nbytes if self.state.kv else 0,
             "kv_layers": self.state.kv.n_layers_cached if self.state.kv else 0,
             "tokenizer": self.token_info(),
+            "token_source": self.token_source,
         }
         if tok_err:
             self._load_stats["tokenizer_error"] = tok_err
@@ -325,6 +342,18 @@ class GgufRuntime(ModelRuntime):
         one, so it is tokenized with add_bos=False. (Tokenizer.encode also refuses
         to double it.)
         """
+        if self.token_source == "native":
+            try:
+                from .native_prompt import render_chat_native
+                return render_chat_native(messages, self.tokenizer,
+                                          add_generation_prompt=add_generation_prompt,
+                                          enable_thinking=enable_thinking)
+            except EnvelopeError:
+                raise                                    # an unrecognised template is fatal
+            except Exception as e:                       # noqa: BLE001
+                raise RuntimeError(
+                    "native chat renderer failed (%s: %s); set AERO_NATIVE_PROMPT=0 to "
+                    "fall back to the Python renderer deliberately" % (type(e).__name__, e))
         return render_chat(messages, self.tokenizer,
                            add_generation_prompt=add_generation_prompt,
                            enable_thinking=enable_thinking)
@@ -349,9 +378,14 @@ class GgufRuntime(ModelRuntime):
         if self.tokenizer is None:
             return {"available": False}
         t = self.tokenizer
-        return {"available": True, "vocab": t.n_vocab,
-                "merges": len(t.bpe_ranks), "specials": len(t._special),
-                "eos_id": t.eos_id}
+        merges = getattr(t, "n_merges", None)
+        if merges is None:
+            merges = len(getattr(t, "bpe_ranks", {}) or {})
+        specials = getattr(t, "n_special", None)
+        if specials is None:
+            specials = len(getattr(t, "_special", []) or [])
+        return {"available": True, "vocab": t.n_vocab, "merges": merges,
+                "specials": specials, "eos_id": t.eos_id, "via": self.token_source}
 
     # ---- the native block loop -------------------------------------------
     def _build_native_loop(self, native_model_module):

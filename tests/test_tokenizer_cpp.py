@@ -139,7 +139,9 @@ def oracle(model, text):
     """llama.cpp's own ids for `text`. None if the binary is missing."""
     if not os.path.exists(LLAMA_TOKENIZE):
         return None
-    p = subprocess.run([LLAMA_TOKENIZE, "-m", model, "-p", text, "--ids"],
+    # --no-escape: llama-tokenize otherwise interprets backslash escapes in the prompt
+    # before tokenizing, which would corrupt any test string containing a literal '\'.
+    p = subprocess.run([LLAMA_TOKENIZE, "-m", model, "-p", text, "--ids", "--no-escape"],
                        capture_output=True, text=True)
     for line in reversed(p.stdout.strip().splitlines()):
         line = line.strip()

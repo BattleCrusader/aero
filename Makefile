@@ -39,7 +39,7 @@ PYTESTS := $(wildcard tests/test_*.py)
 # to src/kv.cpp and src/attention_layer.cpp were not in the library under test, which
 # is why the attention suite kept faulting after being fixed. Literal paths (and $(BUILD),
 # which is defined above) cannot go stale-by-expansion.
-all: $(BUILD)/test_memory_guard $(BUILD)/test_metal_guard $(BUILD)/aero-load-demo $(BUILD)/aero-bwprobe $(BUILD)/test_kernels $(BUILD)/test_tensor $(BUILD)/test_ssm_cpp $(BUILD)/test_gguf $(BUILD)/test_transformer $(KLIB) $(BUILD)/libaero_ssm.dylib $(BUILD)/libaero_transformer.dylib $(BUILD)/libaero_tensor.dylib $(BUILD)/libaero_model.dylib $(BUILD)/libaero_kv.dylib $(BUILD)/test_model_cpp $(BUILD)/libaero_attn.dylib $(BUILD)/test_moe_cpp $(BUILD)/libaero_guard.dylib
+all: $(BUILD)/test_memory_guard $(BUILD)/test_metal_guard $(BUILD)/aero-load-demo $(BUILD)/aero-bwprobe $(BUILD)/test_kernels $(BUILD)/test_tensor $(BUILD)/test_ssm_cpp $(BUILD)/test_gguf $(BUILD)/test_transformer $(KLIB) $(BUILD)/libaero_ssm.dylib $(BUILD)/libaero_transformer.dylib $(BUILD)/libaero_tensor.dylib $(BUILD)/libaero_model.dylib $(BUILD)/libaero_kv.dylib $(BUILD)/test_model_cpp $(BUILD)/libaero_attn.dylib $(BUILD)/test_moe_cpp $(BUILD)/libaero_guard.dylib $(BUILD)/libaero_tokenizer.dylib $(BUILD)/libaero_chat.dylib $(BUILD)/libaero_arch.dylib
 
 # ---- native kernels ----
 # The test binary links the kernel TU directly, so `make test-cpp` proves the
@@ -288,6 +288,8 @@ test-model: all check-py
 		$(PY) -W error::RuntimeWarning tests/test_hook_guard.py 2>&1 | tail -8; echo; \
 		$(PY) -W error::RuntimeWarning tests/test_plan_footprint.py 2>&1 | tail -8; echo; \
 		$(PY) tests/test_attn_native.py 2>&1 | tail -14; echo; \
+		$(PY) tests/test_tokenizer_cpp.py 2>&1 | tail -10; echo; \
+		$(PY) tests/test_chat_template_cpp.py 2>&1 | tail -10; echo; \
 		$(PY) -W error::RuntimeWarning tests/test_quant_native_extra.py 2>&1 | tail -8; echo; \
 		$(PY) tests/test_quant_oracle.py 2>&1 | tail -14; echo; \
 		$(PY) -W error::RuntimeWarning tests/test_model.py; echo; \
@@ -376,3 +378,21 @@ probe: $(BUILD)/aero-bwprobe
 
 clean:
 	@rm -rf $(BUILD)
+
+# ---- tokenizer, chat template, arch descriptor (the prompt path, native) -----
+# The three modules that take Python out of prompt building. Each is SELF-CONTAINED
+# (no undefined aero symbols, checked with nm -u) and builds from one translation unit,
+# so they get plain -shared rules. They were built by hand once before these rules
+# existed, which meant `make all` could not rebuild them -- the same staleness class
+# that hid the kv and attention fixes from the gate.
+$(BUILD)/libaero_tokenizer.dylib: src/tokenizer.cpp include/aero/tokenizer.hpp src/tokenizer_unicode_tables.inc include/aero/gguf.hpp src/gguf.cpp $(KSRC)
+	@mkdir -p $(BUILD)
+	$(CXX) -std=c++17 $(CXXFLAGS) -fPIC -shared src/tokenizer.cpp src/gguf.cpp $(KSRC) -o $@ -pthread
+
+$(BUILD)/libaero_chat.dylib: src/chat_template.cpp include/aero/chat_template.hpp
+	@mkdir -p $(BUILD)
+	$(CXX) -std=c++17 $(CXXFLAGS) -fPIC -shared src/chat_template.cpp -o $@
+
+$(BUILD)/libaero_arch.dylib: src/arch.cpp include/aero/arch.hpp
+	@mkdir -p $(BUILD)
+	$(CXX) -std=c++17 $(CXXFLAGS) -fPIC -shared src/arch.cpp -o $@
