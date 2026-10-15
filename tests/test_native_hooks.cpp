@@ -134,18 +134,31 @@ int main(int argc, char** argv) {
             int64_t pB[1] = {n - 1};
             int32_t last[1] = {ids[n - 1]};
             const int okB = aero_model_forward(m3, last, 1, pB, lB.data());
+            // THE REFERENCE MUST BE THE SAME POSITION. My first cut compared the (n-1)-token
+            // prefill's logits -- which predict AFTER position n-2 -- against the decode's,
+            // which predict AFTER position n-1. Adjacent positions legitimately differ a lot,
+            // so that "invariant" was 23.7 logits of nothing. A full n-token forward predicts
+            // after position n-1 too, so it is the comparable quantity.
+            std::vector<float> lF((size_t)aero_model_vocab(m3), 0.0f);
+            aero_model_t m4 = aero_model_open(path.c_str(), &g, lg.data(), err, (int)sizeof err);
+            if (m4) { aero_model_prepare_state(m4, 512); aero_model_use_native_hooks(m4); }
+            std::vector<int64_t> pF((size_t)n);
+            for (int64_t i = 0; i < n; ++i) pF[(size_t)i] = i;
+            const int okF = m4 ? aero_model_forward(m4, ids, (int)n, pF.data(), lF.data()) : 0;
+            if (m4) aero_model_free(m4);
+            std::printf("       reference: full n-token forward rc=%d (predicts after position n-1)\n", okF);
             double dmax = 0.0;
             int aA = 0, aB = 0;
-            for (size_t i = 0; i < lA.size(); ++i) {
-                dmax = std::max(dmax, (double)std::fabs(lA[i] - lB[i]));
-                if (lA[i] > lA[aA]) aA = (int)i;
+            for (size_t i = 0; i < lF.size(); ++i) {
+                dmax = std::max(dmax, (double)std::fabs(lF[i] - lB[i]));
+                if (lF[i] > lF[aA]) aA = (int)i;
                 if (lB[i] > lB[aB]) aB = (int)i;
             }
-            std::printf("       incremental invariant: rc=%d/%d  max|prefill-decode|=%.3e  "
-                        "argmax %d vs %d\n", okA, okB, dmax, aA, aB);
+            std::printf("       incremental invariant: rc=%d/%d/%d  max|fullforward-decode|=%.3e  "
+                        "argmax %d vs %d\n", okA, okB, okF, dmax, aA, aB);
             check(okA == 1 && okB == 1, "both the prefill and the follow-on decode succeed");
             check(dmax < 1e-3 && aA == aB,
-                  "decoding after a prefill matches the batch prefill (state path is consistent)");
+                  "decoding after a prefill matches a full forward AT THE SAME POSITION");
             aero_model_free(m3);
         }
 
