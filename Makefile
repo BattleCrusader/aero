@@ -182,15 +182,28 @@ engine-cpp: $(BUILD)/test_tensor $(BUILD)/test_gguf $(BUILD)/test_model_cpp
 
 # ---- the native model module (the per-layer block loop) ----
 # It owns the block loop and calls the fused kernels directly on the mmap. The
-# attention / SSM / MoE primitives are registered through a function-pointer
-# table (see include/aero/model.hpp), so those modules are NOT linked here.
+# attention / SSM / MoE primitives are registered through a function-pointer table
+# (see include/aero/model.hpp).
+#
+# THE PRIMITIVES ARE LINKED IN NOW, and that is the point. They were deliberately left out
+# while the only thing registering hooks was Python -- which is exactly why attention, SSM
+# and MoE ran in the interpreter. A C++ hook installer has to be able to reference
+# aero_attention_qwen / aero_ssm_forward_q / the MoE entry point, so those translation
+# units compile into this library. libaero_attn and libaero_ssm stay as the test-facing
+# dylibs built from the same sources; static TUs here mean no dylib dependency and no
+# symbol clash at load time.
 MSRC := src/model.cpp
 MHDR := include/aero/model.hpp
 MLIB := $(BUILD)/libaero_model.dylib
 
-$(MLIB): $(MSRC) $(MHDR) $(GSRC) $(GHDR) $(KSRC) $(KHDR) $(TSRC) $(THDR)
+# the native primitives the C++ hooks call
+PRIMSRC := src/attention_layer.cpp src/ssm.cpp src/moe.cpp src/transformer.cpp src/kv.cpp
+PRIMHDR := include/aero/attention_layer.hpp include/aero/ssm.hpp include/aero/moe.hpp \
+           include/aero/transformer.hpp include/aero/kv.hpp
+
+$(MLIB): $(MSRC) $(MHDR) $(GSRC) $(GHDR) $(KSRC) $(KHDR) $(TSRC) $(THDR) $(PRIMSRC) $(PRIMHDR)
 	@mkdir -p $(BUILD)
-	$(CXX) -std=c++17 $(CXXFLAGS) -fPIC -shared $(MSRC) $(GSRC) $(KSRC) $(TSRC) \
+	$(CXX) -std=c++17 $(CXXFLAGS) -fPIC -shared $(MSRC) $(GSRC) $(KSRC) $(TSRC) $(PRIMSRC) \
 		-o $@ -pthread
 
 $(BUILD)/test_model_cpp: $(MSRC) tests/test_model_cpp.cpp $(MHDR) $(GSRC) $(KSRC) $(TSRC) $(GHDR) $(KHDR) $(THDR)
