@@ -101,6 +101,11 @@ public:
     // call with a context the existing allocation already covers does nothing.
     void init_state(int64_t context);
 
+    // The native layer implementations the hooks call. Public so the trampolines below can
+    // reach them; they return false (never a wrong result) when the file lacks a tensor or
+    // the state was not allocated, so the caller can fall back rather than trust garbage.
+    bool native_ssm(int layer, const float* h, int T, int n_embd, float* out);
+
     // tokens -> logits for the LAST position (vocab floats). Returns false when
     // a needed primitive is missing or the file lacks a tensor this layout
     // requires, so the caller can fall back to another path.
@@ -199,6 +204,8 @@ int aero_model_forward(aero_model_t m, const int32_t* tokens, int n_tokens,
                        const int64_t* positions, float* logits);
 
 int aero_model_prepare_state(aero_model_t m, int64_t n_ctx);
+// Install the C++ layer hooks. Needs prepare_state() first; returns 1 when installed.
+int aero_model_use_native_hooks(aero_model_t m);
 int aero_model_n_layer(aero_model_t m);
 int aero_model_n_embd(aero_model_t m);
 int aero_model_vocab(aero_model_t m);

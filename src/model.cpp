@@ -11,6 +11,7 @@
 #include "aero/kernels.hpp"
 #include "aero/tensor.hpp"
 #include "aero/kv.hpp"
+#include "aero/ssm.hpp"
 
 namespace aero {
 namespace {
@@ -377,6 +378,55 @@ int aero_model_forward(aero_model_t m, const int32_t* tokens, int n_tokens,
 // Exposed rather than automatic: the Python path must keep working unchanged while the
 // native hooks are built, and an unrequested 268 MB of KV slots at n_ctx=4096 across 8
 // attention layers is not something to allocate behind a caller's back.
+// ONE SSM LAYER, IN C++. This is the first native hook: 24 of Qwen3.8's 32 layers and 24
+// of Ornith's 32 are SSM, and until now every one of them ran in the interpreter.
+//
+// Descriptor order is the primitive's, verified against its own indexing (ssm.cpp):
+//   wptrs[0] qkv  wptrs[1] gate  wptrs[2] alpha  wptrs[3] beta  wptrs[4] out
+// with dts[k] the GGUF type id and wlens[k] the BYTE length -- a quantised descriptor with
+// no length is refused by the primitive rather than read unbounded.
+bool aero::ModelNative::native_ssm(int layer, const float* h, int T, int n_embd, float* out) {
+    if (layer < 0 || (size_t)layer >= state_.size()) return false;
+    LayerState& st = state_[layer];
+    if (st.ssm_state.empty() || st.ssm_tail.empty()) return false;   // prepare_state first
+
+    const std::string p = blk(layer);
+    static const char* kNames[5] = {"attn_qkv.weight", "attn_gate.weight",
+                                    "ssm_alpha.weight", "ssm_beta.weight", "ssm_out.weight"};
+    const void* wptrs[5] = {nullptr, nullptr, nullptr, nullptr, nullptr};
+    int64_t wlens[5] = {0, 0, 0, 0, 0};
+    int dts[5] = {0, 0, 0, 0, 0};
+    for (int k = 0; k < 5; ++k) {
+        const TensorInfo* ti = r_->find(p + kNames[k]);
+        if (!ti) return false;
+        wptrs[k] = r_->tensor_data(*ti);
+        wlens[k] = r_->tensor_bytes(*ti);
+        dts[k]   = (int)ti->type;
+    }
+    auto fp32 = [&](const char* nm) -> const float* {
+        const TensorInfo* ti = r_->find(p + nm);
+        return ti ? reinterpret_cast<const float*>(r_->tensor_data(*ti)) : nullptr;
+    };
+    const float* a_log   = fp32("ssm_a");
+    const float* dt_bias = fp32("ssm_dt.bias");
+    const float* conv1d  = fp32("ssm_conv1d.weight");
+    const float* norm    = fp32("ssm_norm.weight");
+    if (!a_log || !dt_bias || !conv1d || !norm) return false;
+
+    const int inner  = (int)hp("ssm.inner_size", 0);
+    const int dstate = (int)hp("ssm.state_size", 0);
+    const int ngrp   = (int)hp("ssm.group_count", 0);
+    const int conv   = (int)hp("ssm.conv_kernel", 0);
+    const int nv     = (int)hp("ssm.time_step_rank", 0);
+    if (inner <= 0 || dstate <= 0 || nv <= 0) return false;
+
+    return aero_ssm_forward_q(h, dts, wptrs, wlens, a_log, dt_bias, conv1d, norm,
+                              T, n_embd, inner, dstate, ngrp, conv, nv,
+                              g_.eps, g_.eps,
+                              st.ssm_tail.data(), &st.tail_len, st.ssm_state.data(),
+                              out, (int)g_.threads) == 1;
+}
+
 int aero_model_prepare_state(aero_model_t m, int64_t n_ctx) {
     auto* model = static_cast<aero::ModelNative*>(m);
     if (!model) return 0;
@@ -386,6 +436,18 @@ int aero_model_prepare_state(aero_model_t m, int64_t n_ctx) {
     } catch (...) {
         return 0;                       // allocation refused; caller reports, never guesses
     }
+}
+
+static int ssm_trampoline(void* ctx, int layer, const float* h, int T, int n_embd,
+                          float* out) {
+    return static_cast<aero::ModelNative*>(ctx)->native_ssm(layer, h, T, n_embd, out) ? 1 : 0;
+}
+
+int aero_model_use_native_hooks(aero_model_t m) {
+    auto* model = static_cast<aero::ModelNative*>(m);
+    if (!model) return 0;
+    model->set_ssm(ssm_trampoline, model);
+    return 1;
 }
 
 int aero_model_n_layer(aero_model_t m) {

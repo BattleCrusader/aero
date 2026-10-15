@@ -65,3 +65,21 @@ int aero_ssm_forward(const float* x,
                      float* state, float* out);
 
 }  // extern "C"
+
+// ---------------------------------------------------------------------- C ABI
+// Declared here so C++ callers (the native hooks in model.cpp) can reach the primitive,
+// not only ctypes. ssm.cpp owns the definitions.
+extern "C" {
+// Quantised SSM layer. wptrs/dts/wlens are 5-wide in the order
+// [qkv, gate, alpha, beta, out]; wlens[k] is the BYTE length of a quantised weight and a
+// quantised descriptor with no length is refused rather than read unbounded.
+int aero_ssm_forward_q(const float* x,
+                       const int* dts, const void* const* wptrs, const int64_t* wlens,
+                       const float* a_log, const float* dt_bias,
+                       const float* conv1d, const float* norm,
+                       int T, int n_embd, int inner_size, int state_size,
+                       int n_group, int conv_kernel, int time_step_rank,
+                       float eps, float norm_eps,
+                       float* conv_tail, int* tail_len,
+                       float* state, float* out, int threads);
+}
