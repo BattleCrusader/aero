@@ -3,7 +3,15 @@
 # command -- tail -- which is always 0. A suite printing '1 failures' therefore sat
 # inside a green `make test` until this was set. SHELL/SHELLFLAGS are re-declared
 # because make's default /bin/sh would ignore them.
-SHELL := /bin/bash
+# GNU Make 3.81 (what macOS ships) IGNORES .SHELLFLAGS -- it is a 3.82+ feature -- so the
+# guard below never applied and every suite piped through `tail` could fail while the
+# recipe still exited 0. Measured, not assumed: with .SHELLFLAGS set, a failing command
+# piped through tail gives recipe exit 0; with the flags moved into SHELL it gives exit 2.
+# It masked a real death: tests/test_hook_guard.py raised TypeError mid-suite, never
+# printed its summary line, and `make test` still exited 0 -- so neither a FAIL grep nor a
+# "N checks, M failures" grep could see it. .SHELLFLAGS is kept for Make 3.82+; SHELL
+# carries the flags because that is the form that works here.
+SHELL := /bin/bash -eu -o pipefail
 .SHELLFLAGS := -eu -o pipefail -c
 
 CXX      ?= clang++
@@ -322,9 +330,9 @@ test-wrappers: all check-py
 	@printf '/exit\n' | ./aero-chat --runtime echo --model smoke > /dev/null \
 		&& echo "aero-chat  : REPL loop ok"
 	@printf 'hi\n/exit\n' | ./aero-chat --runtime echo --model smoke \
-		| grep -q "echo:smoke" && echo "aero-chat  : answered ok"
+		| grep "echo:smoke" > /dev/null && echo "aero-chat  : answered ok"
 	@printf 'hi\n/exit\n' | ./aero-chat --runtime echo --model smoke 2>$(BUILD)/pipe.err \
-		| head -2 > /dev/null; \
+		| sed -n '1,2p' > /dev/null; \
 		if grep -q BrokenPipe $(BUILD)/pipe.err; then \
 			echo "aero-chat  : BrokenPipeError on early pipe close -- FAIL"; exit 1; \
 		else echo "aero-chat  : clean close when the pipe closes early"; fi

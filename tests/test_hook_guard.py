@@ -152,7 +152,7 @@ else:
     check(not kl.aero_kv_slot_new(cap, heads, dim, 9, 0), "unknown dtype refused")
     check(kl.aero_kv_slot_write(s, cap, 0, vec.ctypes.data_as(POINTER(c_float))) == 0,
           f"write at index cap ({cap}) refused -- no out-of-bounds write")
-    check(kl.aero_kv_slot_read(s, cap, np.zeros(dim, np.float32).ctypes.data_as(
+    check(kl.aero_kv_slot_read(s, cap, 0, np.zeros(dim, np.float32).ctypes.data_as(
         POINTER(c_float))) == 0, "read at index cap refused")
     kl.aero_kv_slot_free(s)
 
