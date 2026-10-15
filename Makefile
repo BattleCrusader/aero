@@ -427,3 +427,18 @@ $(BUILD)/libaero_chat.dylib: src/chat_template.cpp include/aero/chat_template.hp
 $(BUILD)/libaero_arch.dylib: src/arch.cpp include/aero/arch.hpp
 	@mkdir -p $(BUILD)
 	$(CXX) -std=c++17 $(CXXFLAGS) -fPIC -shared src/arch.cpp -o $@
+
+# ---- the ANE path (CoreML), Obj-C++ ------------------------------------------
+# No Python at any stage: this loads a compiled .mlmodelc and runs it. CoreML is the only
+# route to the Neural Engine -- there is no public ANE API -- and CPU_AND_NE is the
+# compute-unit selection that reaches it. The model is authored as a protobuf in C++ and
+# compiled by Apple's own coremlcompiler (Xcode toolchain), not by coremltools.
+$(BUILD)/libaero_ane.dylib: src/ane.mm include/aero/ane.hpp
+	@mkdir -p $(BUILD)
+	$(CXX) -std=c++17 -fobjc-arc -fPIC -shared -Iinclude src/ane.mm -o $@ \
+		-framework CoreML -framework Foundation
+
+$(BUILD)/test_ane_cpp: tests/test_ane_cpp.cpp $(BUILD)/libaero_ane.dylib include/aero/ane.hpp
+	@mkdir -p $(BUILD)
+	$(CXX) -std=c++17 -Iinclude tests/test_ane_cpp.cpp -o $@ \
+		$(BUILD)/libaero_ane.dylib -framework CoreML -framework Foundation
