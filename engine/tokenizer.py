@@ -59,10 +59,23 @@ _L = (r"A-Za-z\u00c0-\u024f\u0370-\u03ff\u0400-\u04ff"
       r"\u4e00-\u9fff\u3040-\u30ff\uac00-\ud7af")
 _N = r"0-9\u0660-\u0669\u06f0-\u06f9"
 
+# GPT-2's pre-tokeniser, with the optional leading space on EVERY chunk type.
+#
+# It has to be on all of them. With `[{_L}]+` first, "Hello world" splits as "Hello"
+# and then a lone " world" -- which cannot match the punctuation branch, because `w`
+# IS a letter -- so the space falls through to `\s+` and becomes ITS OWN TOKEN. That is
+# what shipped: "Hello world" -> [9419, 220, 14194] where llama.cpp gives [9419, 1814],
+# and " Paris" -> [220, 57590] where llama.cpp gives [11751].
+#
+# The failure is invisible to every test we had: the ids look plausible and encode ->
+# decode is lossless either way, so round-tripping proves nothing. But the model is fed
+# "Ġ" + "world" instead of "Ġworld" -- a prompt it never saw in training -- and answers
+# gibberish. Caught only by comparing against llama.cpp's own tokeniser (llama-tokenize),
+# an independent implementation of the same published rule.
 _PAT = re.compile(
     rf"(?i:'s|'t|'re|'ve|'m|'ll|'d)"
-    rf"|[{_L}]+"
-    rf"|[{_N}]"
+    rf"| ?[{_L}]+"
+    rf"| ?[{_N}]+"
     rf"| ?[^\s{_L}{_N}]+[\r\n]*"
     rf"|\s*[\r\n]+"
     rf"|\s+(?!\S)"

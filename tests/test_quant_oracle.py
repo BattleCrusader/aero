@@ -110,6 +110,43 @@ for label, path in MODELS:
             checked += 1
         check(checked >= 1, "at least one type cross-checked on real weights")
 
+# ---------------------------------------------------------------------------
+# THE TOKENISER, same method, same reason. Our encoder round-trips perfectly and always
+# did -- encode->decode is lossless whether or not the pre-tokeniser is right -- so no
+# round-trip test can see the bug that made every prompt subtly wrong: our pattern put
+# the optional leading space ONLY on the punctuation branch, so "Hello world" became
+# "Hello" + "Ġ" + "world" instead of "Hello" + "Ġworld", and " Paris" became "Ġ"+"Paris"
+# instead of the single token "ĠParis". llama.cpp's own tokeniser is the oracle.
+import subprocess                                                   # noqa: E402
+TOK_BIN = "/Volumes/Backup/Development/PrismML-llama.cpp/build/bin/llama-tokenize"
+TOK_CASES = ["The capital of France is", "Hello world", "hello world", " Paris",
+             "capital", "The quick brown fox", "def main():\n    pass", "1 + 1 = 2"]
+if not os.path.isfile(TOK_BIN):
+    print("  skip the tokeniser oracle (llama-tokenize not built)")
+else:
+    from engine.tokenizer import Tokenizer                            # noqa: E402
+    for label, path in MODELS:
+        if not os.path.isfile(path):
+            continue
+        print("\n[tokeniser vs llama-tokenize: %s]" % label)
+        with GGUFReader(path) as r:
+            tk = Tokenizer.from_gguf(r)
+            agree = 0
+            for text in TOK_CASES:
+                out = subprocess.run([TOK_BIN, "-m", path, "-p", text, "--ids"],
+                                     capture_output=True, text=True)
+                line = [l for l in out.stdout.splitlines() if l.strip().startswith("[")]
+                if not line:
+                    continue
+                ref = eval(line[-1])
+                ours = tk.encode(text)
+                if ref == ours:
+                    agree += 1
+                else:
+                    check(False, "%r -> llama=%s ours=%s" % (text, ref, ours))
+            check(agree == len(TOK_CASES),
+                  "all %d pre-tokeniser cases match llama.cpp exactly" % len(TOK_CASES))
+
 print("\n=== %d checks, %d failures%s ==="
       % (CHECKS, FAILS, (", %d skipped" % SKIPS) if SKIPS else ""))
 sys.exit(1 if FAILS else 0)

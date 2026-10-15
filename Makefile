@@ -1,3 +1,11 @@
+# A FAILING SUITE MUST FAIL THE GATE. Every test line is piped through `tail` to keep
+# the log readable, and without pipefail a pipeline reports the status of its LAST
+# command -- tail -- which is always 0. A suite printing '1 failures' therefore sat
+# inside a green `make test` until this was set. SHELL/SHELLFLAGS are re-declared
+# because make's default /bin/sh would ignore them.
+SHELL := /bin/bash
+.SHELLFLAGS := -eu -o pipefail -c
+
 CXX      ?= clang++
 CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -Iinclude
 BUILD    := build

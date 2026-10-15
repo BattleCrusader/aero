@@ -95,7 +95,13 @@ def test_ids(tk):
           f"the id resolves back to 'Hello' in the vocab ({tk.tokens[ids[0]]!r})")
     # a known multi-token string
     ids2 = tk.encode("Hello, world!")
-    check(len(ids2) == 5, f"'Hello, world!' is 5 tokens ({ids2})")
+    # THE ORACLE'S ANSWER, not ours. This check used to assert 5 tokens -- the shape our
+    # broken pre-tokeniser produced by splitting the space off as its own token. It
+    # pinned the bug: a test written from the same belief as the code cannot catch it.
+    # llama-tokenize says 4: ['Hello', ',', 'Ġworld', '!']. Assert the exact ids, so the
+    # failure mode (an extra 220 and a bare 'world') is impossible to reintroduce.
+    check(ids2 == [9419, 11, 1814, 0],
+          f"'Hello, world!' matches llama.cpp exactly, 4 tokens ({ids2})")
     got = [tk.tokens[i] for i in ids2]
     check(all(t is not None for t in got), "every id resolves in the vocab")
     print(f"       'Hello, world!' -> {ids2}")
