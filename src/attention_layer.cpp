@@ -133,25 +133,56 @@ bool attention_layer(const AttentionLayerArgs& a, float* out) {
         for (int64_t i = 0; i <= max_pos; ++i) allpos[(size_t)i] = (int32_t)i;
         rope_tables(n_rot, allpos.data(), max_pos + 1, a.rope_base, n_rot,
                     a.freq_factors, a.n_ff, cos_tab.data(), sin_tab.data());
+        // ONE POSITION PER ROW, and that is not optional.
+        //
+        // apply_rope takes (n_rows, positions) and reads positions[r] for EVERY row. We
+        // call it with T*H rows, but the caller's qpos holds only T entries -- so rows
+        // >= T read PAST THE END of that array. The garbage index went straight into
+        // `cos_tab + pi*half` and faulted inside apply_rope (EXC_BAD_ACCESS, a wild
+        // address), which is the SIGSEGV/SIGBUS this layer has been dying of. It was
+        // also the quieter half of the bug: at T=1 the out-of-range entries are whatever
+        // follows in memory, so heads 1..3 were rotated at the wrong position and a step
+        // WITH a populated cache could not match the same step without one.
+        //
+        // Every head of one token shares that token's position, so the expansion is
+        // r / n_heads over the row index.
+        std::vector<int32_t> qpos_rows((size_t)(a.T * H)), kpos_rows((size_t)(a.T * HK));
+        for (int64_t r = 0; r < a.T * H; ++r) qpos_rows[(size_t)r] = a.qpos[r / H];
+        for (int64_t r = 0; r < a.T * HK; ++r) kpos_rows[(size_t)r] = a.qpos[r / HK];
         apply_rope(q_raw.data(), a.T * H, D, n_rot, cos_tab.data(), sin_tab.data(),
-                   a.qpos, RopeMode::Neox);
+                   qpos_rows.data(), RopeMode::Neox);
         apply_rope(k_raw.data(), a.T * HK, D, n_rot, cos_tab.data(), sin_tab.data(),
-                   a.qpos, RopeMode::Neox);
+                   kpos_rows.data(), RopeMode::Neox);
     }
 
     // ---- 5. KV append (native quantisers) + read-back of the span ----------
     std::vector<float> k_all, v_all;
     int64_t n_kv;
     if (a.k_slot && a.v_slot) {
+        // RING WRAP ON THE WRITE SIDE. A windowed layer's slot holds only cap
+        // positions, so writing at `kv_phys + t` runs off the end once the cache has
+        // wrapped -- an out-of-bounds write. The physical slot for logical position q is
+        // q % cap; the read side below then rotates so index 0 is the oldest retained.
+        //
+        // A NON-ring slot must be big enough for the whole span. Checked rather than
+        // assumed: with a too-small cap this wrote past the cache vectors and corrupted
+        // the heap (the suite faulted with no traceback), and refusing is the honest
+        // outcome -- an overrun here is a caller's geometry bug, not something to clamp.
+        if (!a.k_slot->ring && a.kv_phys + a.T > a.k_slot->cap) return false;
+        if (!a.v_slot->ring && a.kv_phys + a.T > a.v_slot->cap) return false;
         for (int64_t t = 0; t < a.T; ++t) {
-            const int64_t phys = a.kv_phys + t;
+            const int64_t lq = a.kv_phys + t;
+            const int64_t phys = a.k_slot->ring && a.k_slot->cap > 0 ? (lq % a.k_slot->cap) : lq;
             for (int64_t h = 0; h < HK; ++h) {
                 KvSlot& ks = *a.k_slot;
-                const int64_t off = phys * ks.heads * ks.vec_bytes() + h * ks.vec_bytes();
                 const int64_t so = phys * ks.heads + h;
                 const float* krow = k_raw.data() + t * a.k_rows + h * D;
+                // FP32 is FLOAT-indexed: `off` below is BYTES and ks.f32 is a vector<float>,
+                // so using it here wrote 4x too far and corrupted the heap. See kv.hpp.
+                const int64_t off = phys * ks.heads * ks.vec_bytes() + h * ks.vec_bytes();
                 if (ks.dt == KvDType::FP32)
-                    std::memcpy(ks.f32.data() + off, krow, (size_t)(D * sizeof(float)));
+                    std::memcpy(ks.f32.data() + (phys * ks.heads + h) * ks.dim, krow,
+                                (size_t)(D * sizeof(float)));
                 else if (ks.dt == KvDType::INT8)
                     kv_quant_i8(krow, D, ks.i8.data() + off, ks.scale.data() + so);
                 else
@@ -159,25 +190,36 @@ bool attention_layer(const AttentionLayerArgs& a, float* out) {
             }
             for (int64_t h = 0; h < HK; ++h) {
                 KvSlot& vs = *a.v_slot;
-                const int64_t off = phys * vs.heads * vs.vec_bytes() + h * vs.vec_bytes();
                 const int64_t so = phys * vs.heads + h;
                 const float* vrow = v_raw.data() + t * a.v_rows + h * DV;
+                const int64_t off = phys * vs.heads * vs.vec_bytes() + h * vs.vec_bytes();
                 if (vs.dt == KvDType::FP32)
-                    std::memcpy(vs.f32.data() + off, vrow, (size_t)(DV * sizeof(float)));
+                    std::memcpy(vs.f32.data() + (phys * vs.heads + h) * vs.dim, vrow,
+                                (size_t)(DV * sizeof(float)));
                 else if (vs.dt == KvDType::INT8)
                     kv_quant_i8(vrow, DV, vs.i8.data() + off, vs.scale.data() + so);
                 else
                     kv_quant_i4(vrow, DV, vs.i4.data() + off, vs.scale.data() + so);
             }
         }
-        n_kv = a.kv_phys + a.T;
+        const int64_t end = a.kv_phys + a.T;      // logical positions committed
+        // Retained span: a ring holds at most cap positions, so the visible history is
+        // the LAST min(end, cap) of them, rotated so index 0 is the oldest retained.
+        int64_t span = end;
+        if (a.k_slot->ring && a.k_slot->cap > 0) span = std::min(end, a.k_slot->cap);
+        const int64_t base = end - span;           // oldest retained logical position
+        n_kv = span;
         k_all.resize((size_t)(n_kv * HK * D));
         v_all.resize((size_t)(n_kv * HK * DV));
-        for (int64_t p = 0; p < n_kv; ++p)
+        for (int64_t p = 0; p < n_kv; ++p) {
+            const int64_t lq = base + p;
+            const int64_t kp = a.k_slot->ring && a.k_slot->cap > 0 ? (lq % a.k_slot->cap) : lq;
+            const int64_t vp = a.v_slot->ring && a.v_slot->cap > 0 ? (lq % a.v_slot->cap) : lq;
             for (int64_t h = 0; h < HK; ++h) {
-                kv_slot_read(*a.k_slot, p, k_all.data() + (p * HK + h) * D);
-                kv_slot_read(*a.v_slot, p, v_all.data() + (p * HK + h) * DV);
+                kv_slot_read(*a.k_slot, kp, h, k_all.data() + (p * HK + h) * D);
+                kv_slot_read(*a.v_slot, vp, h, v_all.data() + (p * HK + h) * DV);
             }
+        }
     } else {
         k_all = k_raw;
         v_all = v_raw;

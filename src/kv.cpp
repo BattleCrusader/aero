@@ -117,17 +117,17 @@ int64_t aero_kv_slot_bytes(void* s) {
 
 // Write one (position, head) vector at a PHYSICAL index (the ring wrap is the
 // caller's business, exactly as in the Python _write_side spans).
-int aero_kv_slot_write(void* s, int64_t phys, const float* x) {
+int aero_kv_slot_write(void* s, int64_t phys, int64_t head, const float* x) {
     auto* sl = static_cast<aero::KvSlot*>(s);
     if (!sl || !x || phys < 0 || phys >= sl->cap) return 0;
-    aero::kv_slot_write(*sl, phys, x);
+    aero::kv_slot_write(*sl, phys, head, x);
     return 1;
 }
 
-int aero_kv_slot_read(void* s, int64_t phys, float* out) {
+int aero_kv_slot_read(void* s, int64_t phys, int64_t head, float* out) {
     auto* sl = static_cast<aero::KvSlot*>(s);
     if (!sl || !out || phys < 0 || phys >= sl->cap) return 0;
-    aero::kv_slot_read(*sl, phys, out);
+    aero::kv_slot_read(*sl, phys, head, out);
     return 1;
 }
 

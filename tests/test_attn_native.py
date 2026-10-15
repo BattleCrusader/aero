@@ -135,5 +135,111 @@ with GGUFReader(P) as r:
     print(f"       max |py - native| = {d.max():.3e}  rel = {rel:.3e}")
     check(rel < 1e-4, f"attention parity on the REAL layer (rel {rel:.3e})")
 
+# ---------------------------------------------------------------------------
+# [2] THE THREE BUGS THAT MADE THIS SUITE DIE, pinned so they cannot come back.
+# The suite used to flap between "2 checks pass" and SIGSEGV on unchanged code, which
+# is the signature of heap corruption rather than logic -- and all three causes were
+# real. Each check below fails loudly on the old code.
+kvlib = ctypes.CDLL(KVL) if os.path.exists(KVL) else None
+if kvlib is None:
+    print("  (skipped: libaero_kv absent)")
+else:
+    print("\n[2] kv head index, ring wrap, and per-row rope positions")
+    kvlib.aero_kv_slot_new.argtypes = [c_int64, c_int64, c_int64, c_int, c_int]
+    kvlib.aero_kv_slot_new.restype = c_void_p
+    kvlib.aero_kv_slot_write.argtypes = [c_void_p, c_int64, c_int64, POINTER(c_float)]
+    kvlib.aero_kv_slot_write.restype = c_int
+    kvlib.aero_kv_slot_read.argtypes = [c_void_p, c_int64, c_int64, POINTER(c_float)]
+    kvlib.aero_kv_slot_read.restype = c_int
+    kvlib.aero_kv_slot_free.argtypes = [c_void_p]
+
+    # (a) THE HEAD INDEX. kv_slot_read used to compute `phys * heads * vec_bytes()`,
+    # i.e. head 0's slot, for every head -- so reading head 1 returned head 0's vector.
+    cap, heads, dim = 8, 4, 16
+    sl = kvlib.aero_kv_slot_new(cap, heads, dim, 0, 0)       # fp32, no ring
+    a_vec = np.full(dim, 1.5, np.float32)
+    b_vec = np.full(dim, -2.5, np.float32)
+    kvlib.aero_kv_slot_write(sl, 2, 0, a_vec.ctypes.data_as(POINTER(c_float)))
+    kvlib.aero_kv_slot_write(sl, 2, 1, b_vec.ctypes.data_as(POINTER(c_float)))
+    got = np.zeros(dim, np.float32)
+    kvlib.aero_kv_slot_read(sl, 2, 0, got.ctypes.data_as(POINTER(c_float)))
+    check(np.array_equal(got, a_vec), "head 0 reads back its own vector")
+    got2 = np.zeros(dim, np.float32)
+    kvlib.aero_kv_slot_read(sl, 2, 1, got2.ctypes.data_as(POINTER(c_float)))
+    check(np.array_equal(got2, b_vec),
+          "head 1 reads back ITS vector, not head 0's (the old bug)")
+    check(not np.array_equal(got2, a_vec), "and it is not merely a copy of head 0")
+    kvlib.aero_kv_slot_free(sl)
+
+    # (b) ONE POSITION PER ROW. apply_rope reads positions[r] for every row and was
+    # called with T*H rows against a T-entry array, so rows >= T read past the end --
+    # EXC_BAD_ACCESS inside apply_rope. At position 0 a step WITH a cache must equal the
+    # same step WITHOUT one (both attend over exactly one position).
+    k_sl = kvlib.aero_kv_slot_new(8, HK, D, 0, 0)
+    v_sl = kvlib.aero_kv_slot_new(8, HK, D, 0, 0)
+    pos0 = np.array([0], np.int32)
+    out_s = np.zeros((1, NE), np.float32)
+    ok_s = lib.aero_attention_qwen(
+        x.ctypes.data_as(POINTER(c_float)), 1, NE,
+        pos0.ctypes.data_as(POINTER(c_int32)),
+        native_dt(q_info.type_id), q_b, q_info.shape[0], 1,
+        native_dt(k_info.type_id), k_b, k_info.shape[0],
+        native_dt(v_info.type_id), v_b, v_info.shape[0],
+        native_dt(o_info.type_id), o_b, o_info.shape[0],
+        qn.ctypes.data_as(POINTER(c_float)), kn.ctypes.data_as(POINTER(c_float)),
+        0, 1e-6, 1e7, 64, None, 0,
+        H, HK, D, D, 0.0, 0, 1, 8,
+        ctypes.c_void_p(k_sl), ctypes.c_void_p(v_sl), 0,
+        out_s.ctypes.data_as(POINTER(c_float)))
+    check(ok_s == 1, "attention with a KV slot returns 1 (no wild rope read)")
+    ref0 = T.attention(x, pos0.astype(np.int64), w, acfg)
+    rel0 = np.abs(ref0 - out_s).max() / max(float(np.abs(ref0).max()), 1e-9)
+    check(rel0 < 1e-4,
+          f"position 0 with a cache == without one (rel {rel0:.3e}) -- rope rows correct")
+
+    # (c) RING WRAP. Writing at kv_phys + t ran past a wrapped slot's cap: an
+    # out-of-bounds WRITE into the cache vectors (heap corruption). With cap=4 and
+    # kv_phys >= cap the physical index must wrap, not overrun.
+    rk = kvlib.aero_kv_slot_new(4, HK, D, 0, 1)      # ring=1 -- the wrap cases need it
+    rv = kvlib.aero_kv_slot_new(4, HK, D, 0, 1)
+    for kvp in (4, 5, 9):
+        posn = np.array([kvp], np.int32)
+        outn = np.zeros((1, NE), np.float32)
+        r_ok = lib.aero_attention_qwen(
+            x.ctypes.data_as(POINTER(c_float)), 1, NE,
+            posn.ctypes.data_as(POINTER(c_int32)),
+            native_dt(q_info.type_id), q_b, q_info.shape[0], 1,
+            native_dt(k_info.type_id), k_b, k_info.shape[0],
+            native_dt(v_info.type_id), v_b, v_info.shape[0],
+            native_dt(o_info.type_id), o_b, o_info.shape[0],
+            qn.ctypes.data_as(POINTER(c_float)), kn.ctypes.data_as(POINTER(c_float)),
+            0, 1e-6, 1e7, 64, None, 0,
+            H, HK, D, D, 0.0, 0, 1, 8,
+            ctypes.c_void_p(rk), ctypes.c_void_p(rv), kvp,
+            outn.ctypes.data_as(POINTER(c_float)))
+        check(r_ok == 1 and np.isfinite(outn).all(),
+              f"kv_phys={kvp} past cap=4 (ring) wraps instead of overrunning")
+    kvlib.aero_kv_slot_free(rk)
+    kvlib.aero_kv_slot_free(rv)
+    # a non-ring slot that is too small must be REFUSED, not overrun
+    small = kvlib.aero_kv_slot_new(2, HK, D, 0, 0)
+    out_x = np.zeros((1, NE), np.float32)
+    r_refused = lib.aero_attention_qwen(
+        x.ctypes.data_as(POINTER(c_float)), 1, NE,
+        np.array([7], np.int32).ctypes.data_as(POINTER(c_int32)),
+        native_dt(q_info.type_id), q_b, q_info.shape[0], 1,
+        native_dt(k_info.type_id), k_b, k_info.shape[0],
+        native_dt(v_info.type_id), v_b, v_info.shape[0],
+        native_dt(o_info.type_id), o_b, o_info.shape[0],
+        qn.ctypes.data_as(POINTER(c_float)), kn.ctypes.data_as(POINTER(c_float)),
+        0, 1e-6, 1e7, 64, None, 0,
+        H, HK, D, D, 0.0, 0, 1, 8,
+        ctypes.c_void_p(small), ctypes.c_void_p(small), 7,
+        out_x.ctypes.data_as(POINTER(c_float)))
+    check(r_refused == 0, "a non-ring slot too small for the span is refused (rc=0, not corruption)")
+    kvlib.aero_kv_slot_free(small)
+    kvlib.aero_kv_slot_free(k_sl)
+    kvlib.aero_kv_slot_free(v_sl)
+
 print(f"\n=== {CHECKS} checks, {FAILS} failures ===")
 sys.exit(1 if FAILS else 0)

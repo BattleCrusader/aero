@@ -28,7 +28,18 @@ PYTESTS := $(wildcard tests/test_*.py)
 .PHONY: all test test-cpp test-engine test-server test-wrappers demo probe test-cached test-cache-status \
         test-cache-clear check-py kernels guard engine-cpp clean
 
-all: $(BUILD)/test_memory_guard $(BUILD)/test_metal_guard $(BUILD)/aero-load-demo $(BUILD)/aero-bwprobe $(BUILD)/test_kernels $(BUILD)/test_tensor $(BUILD)/test_ssm_cpp $(BUILD)/test_gguf $(BUILD)/test_transformer $(KLIB) $(SLIB) $(XLIB) $(TLIB) $(MLIB) $(KVLIB) $(BUILD)/test_model_cpp $(ATTLIB) $(BUILD)/test_moe_cpp
+# EVERY PREREQUISITE HERE IS A LITERAL PATH OR A VARIABLE DEFINED ABOVE THIS LINE.
+#
+# This rule used to name $(SLIB) $(XLIB) $(TLIB) $(MLIB) $(KVLIB) $(ATTLIB), all of
+# which are := defined LATER in the file (lines 50-172). make expands a prerequisite
+# list when it reads the rule, so those expanded to EMPTY STRINGS -- `all` had no
+# library prerequisites at all and `make all` printed "Nothing to be done" forever. The
+# consequence was worse than a slow build: `test-cpp: all`, so every test in the gate
+# could run against a STALE dylib built from older sources. It hid a real fix -- edits
+# to src/kv.cpp and src/attention_layer.cpp were not in the library under test, which
+# is why the attention suite kept faulting after being fixed. Literal paths (and $(BUILD),
+# which is defined above) cannot go stale-by-expansion.
+all: $(BUILD)/test_memory_guard $(BUILD)/test_metal_guard $(BUILD)/aero-load-demo $(BUILD)/aero-bwprobe $(BUILD)/test_kernels $(BUILD)/test_tensor $(BUILD)/test_ssm_cpp $(BUILD)/test_gguf $(BUILD)/test_transformer $(KLIB) $(BUILD)/libaero_ssm.dylib $(BUILD)/libaero_transformer.dylib $(BUILD)/libaero_tensor.dylib $(BUILD)/libaero_model.dylib $(BUILD)/libaero_kv.dylib $(BUILD)/test_model_cpp $(BUILD)/libaero_attn.dylib $(BUILD)/test_moe_cpp $(BUILD)/libaero_guard.dylib
 
 # ---- native kernels ----
 # The test binary links the kernel TU directly, so `make test-cpp` proves the
@@ -247,22 +258,25 @@ test-cpp: all
 		AERO_MAX_RAM=$${AERO_MAX_RAM:-5G} ./$(BUILD)/test_gguf "$(REAL_MODEL)"; \
 	 else echo "gguf test: SKIPPED (no $(REAL_MODEL))"; fi
 
-test-engine: check-py
+test-engine: all check-py
 	@if [ -x "$(PY)" ]; then $(PY) tests/test_engine.py; \
 	 else echo "engine test: SKIPPED (no $(PY))"; fi
 
-test-server: check-py
+test-server: all check-py
 	@if [ -x "$(PY)" ]; then $(PY) tests/test_server.py; \
 	 else echo "server test: SKIPPED (no $(PY))"; fi
 
 # Model-side suites: GGUF parse + dequant, transformer core, SSM, optimisations.
-# NOTE: tests/test_attn_native.py is deliberately NOT in the gate. The native
+# The native attention suite IS in the gate now: its crash (SIGSEGV/SIGBUS, flapping
+# between runs) was root-caused and fixed -- three real bugs: a missing head index
+# in kv_slot_read, an unwrapped ring write/read, and per-row rope positions.
+# Original exclusion note follows (kept for history): the native
 # attention layer segfaults INTERMITTENTLY -- same binary, same inputs: 2 checks /
 # 0 failures on one run, SIGSEGV (139) on the next. A flaky suite makes the gate lie
 # in both directions, so it stays out until the memory bug is fixed. The layer is not
 # used by the engine (the attention hook is still the Python reference). Run by hand:
 #     .venv-cml/bin/python tests/test_attn_native.py
-test-model: check-py
+test-model: all check-py
 	@if [ -x "$(PY)" ]; then \
 		$(PY) tests/test_quant.py; echo; \
 		$(PY) tests/test_transformer.py; echo; \
@@ -273,6 +287,7 @@ test-model: check-py
 		$(PY) -W error::RuntimeWarning tests/test_ssm_hook.py 2>&1 | tail -10; echo; \
 		$(PY) -W error::RuntimeWarning tests/test_hook_guard.py 2>&1 | tail -8; echo; \
 		$(PY) -W error::RuntimeWarning tests/test_plan_footprint.py 2>&1 | tail -8; echo; \
+		$(PY) tests/test_attn_native.py 2>&1 | tail -14; echo; \
 		$(PY) -W error::RuntimeWarning tests/test_quant_native_extra.py 2>&1 | tail -8; echo; \
 		$(PY) tests/test_quant_oracle.py 2>&1 | tail -14; echo; \
 		$(PY) -W error::RuntimeWarning tests/test_model.py; echo; \

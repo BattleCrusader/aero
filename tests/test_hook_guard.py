@@ -100,9 +100,9 @@ else:
     kl.aero_kv_slot_free.argtypes = [c_void_p]
     kl.aero_kv_slot_bytes.argtypes = [c_void_p]
     kl.aero_kv_slot_bytes.restype = c_int64
-    kl.aero_kv_slot_write.argtypes = [c_void_p, c_int64, POINTER(c_float)]
+    kl.aero_kv_slot_write.argtypes = [c_void_p, c_int64, c_int64, POINTER(c_float)]
     kl.aero_kv_slot_write.restype = c_int
-    kl.aero_kv_slot_read.argtypes = [c_void_p, c_int64, POINTER(c_float)]
+    kl.aero_kv_slot_read.argtypes = [c_void_p, c_int64, c_int64, POINTER(c_float)]
     kl.aero_kv_slot_read.restype = c_int
 
     cap, heads, dim = 16, 2, 8       # small on purpose
@@ -113,26 +113,26 @@ else:
           f"fp32 slot is {want_bytes} bytes ({cap}x{heads}x{dim}x4)")
 
     vec = (np.random.default_rng(3).standard_normal(dim) * 2.0).astype(np.float32)
-    check(kl.aero_kv_slot_write(s, 5, vec.ctypes.data_as(POINTER(c_float))) == 1,
+    check(kl.aero_kv_slot_write(s, 5, 0, vec.ctypes.data_as(POINTER(c_float))) == 1,
           "write at physical index 5 accepted")
     back = np.zeros(dim, np.float32)
-    check(kl.aero_kv_slot_read(s, 5, back.ctypes.data_as(POINTER(c_float))) == 1,
+    check(kl.aero_kv_slot_read(s, 5, 0, back.ctypes.data_as(POINTER(c_float))) == 1,
           "read back from index 5 accepted")
     check(np.array_equal(back, vec), "fp32 slot round trip is bit-exact")
 
     # untouched positions must still be zero (a fresh slot is zeroed, so an unset
     # position cannot masquerade as data)
     z = np.zeros(dim, np.float32)
-    kl.aero_kv_slot_read(s, 0, z.ctypes.data_as(POINTER(c_float)))
+    kl.aero_kv_slot_read(s, 0, 0, z.ctypes.data_as(POINTER(c_float)))
     check(np.all(z == 0.0), "an unwritten position reads as zeros")
 
     print("\n[4] int8 and int4 slots match the Python quantiser byte-for-byte")
     for dt, name in ((1, "int8"), (2, "int4")):
         s2 = kl.aero_kv_slot_new(cap, heads, dim, dt, 0)
         check(bool(s2), f"{name} slot allocated")
-        kl.aero_kv_slot_write(s2, 2, vec.ctypes.data_as(POINTER(c_float)))
+        kl.aero_kv_slot_write(s2, 2, 0, vec.ctypes.data_as(POINTER(c_float)))
         got = np.zeros(dim, np.float32)
-        kl.aero_kv_slot_read(s2, 2, got.ctypes.data_as(POINTER(c_float)))
+        kl.aero_kv_slot_read(s2, 2, 0, got.ctypes.data_as(POINTER(c_float)))
         if dt == 1:
             sc = np.where(np.abs(vec).max() > 0, np.abs(vec).max() / 127.0,
                           1.0).astype(np.float32)
@@ -150,7 +150,7 @@ else:
     check(not kl.aero_kv_slot_new(cap, 0, dim, 0, 0), "heads=0 refused")
     check(not kl.aero_kv_slot_new(cap, heads, 7, 2, 0), "int4 with odd dim refused")
     check(not kl.aero_kv_slot_new(cap, heads, dim, 9, 0), "unknown dtype refused")
-    check(kl.aero_kv_slot_write(s, cap, vec.ctypes.data_as(POINTER(c_float))) == 0,
+    check(kl.aero_kv_slot_write(s, cap, 0, vec.ctypes.data_as(POINTER(c_float))) == 0,
           f"write at index cap ({cap}) refused -- no out-of-bounds write")
     check(kl.aero_kv_slot_read(s, cap, np.zeros(dim, np.float32).ctypes.data_as(
         POINTER(c_float))) == 0, "read at index cap refused")

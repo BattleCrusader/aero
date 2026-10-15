@@ -102,15 +102,22 @@ inline void kv_unpack_i4(const uint8_t* q, int64_t dim, float* out) {
     }
 }
 
-// Write one (position, head) vector of one side. `pos` is the slot-relative
-// physical index (ring wrap handled by the caller, which owns the spans).
-inline void kv_slot_write(KvSlot& sl, int64_t phys, const float* x) {
-    const int64_t off = phys * sl.heads * sl.vec_bytes();
+// Write one (position, HEAD) vector of one side. `phys` is the slot-relative
+// physical index and `head` the head index; both are required (see the read note).
+inline void kv_slot_write(KvSlot& sl, int64_t phys, int64_t head, const float* x) {
+    // FP32 IS INDEXED IN FLOATS, NOT BYTES. vec_bytes() returns dim*4 for FP32, but
+    // sl.f32 is a vector<float>, so `sl.f32.data() + phys*heads*vec_bytes()` lands
+    // phys*heads*dim*4 FLOATS into a cap*heads*dim buffer -- 4x too far, off the end of
+    // the allocation. It corrupted the heap (free() aborted) and every fp32 slot write
+    // did it. The int8/int4 branches below are correct because i8/i4 are byte-typed
+    // pointers; only this one mixes units. FP32 is the DEFAULT dtype, so this was live.
     if (sl.dt == KvDType::FP32) {
-        std::memcpy(sl.f32.data() + off, x, sl.dim * sizeof(float));
+        const int64_t fo = (phys * sl.heads + head) * sl.dim;      // FLOAT units
+        std::memcpy(sl.f32.data() + fo, x, (size_t)sl.dim * sizeof(float));
         return;
     }
-    const int64_t so = phys * sl.heads;
+    const int64_t off = (phys * sl.heads + head) * sl.vec_bytes();
+    const int64_t so = phys * sl.heads + head;
     if (sl.dt == KvDType::INT8) {
         kv_quant_i8(x, sl.dim, sl.i8.data() + off, sl.scale.data() + so);
         return;
@@ -118,14 +125,21 @@ inline void kv_slot_write(KvSlot& sl, int64_t phys, const float* x) {
     kv_quant_i4(x, sl.dim, sl.i4.data() + off, sl.scale.data() + so);
 }
 
-// Materialise one (position, head) vector as fp32.
-inline void kv_slot_read(const KvSlot& sl, int64_t phys, float* out) {
-    const int64_t off = phys * sl.heads * sl.vec_bytes();
-    const int64_t so = phys * sl.heads;
+// Materialise one (position, HEAD) vector as fp32.
+//
+// THE HEAD INDEX IS NOT OPTIONAL. This used to take (phys) only and compute
+// `off = phys * heads * vec_bytes()`, which is exactly head 0's slot -- so a caller
+// looping per head read HEAD 0's vector into every head's destination. attention_layer
+// did precisely that, which is why a T=1 step with a populated cache disagreed with the
+// same step without one: at position 0 every head must see its own row.
+inline void kv_slot_read(const KvSlot& sl, int64_t phys, int64_t head, float* out) {
     if (sl.dt == KvDType::FP32) {
-        std::memcpy(out, sl.f32.data() + off, sl.dim * sizeof(float));
+        const int64_t fo = (phys * sl.heads + head) * sl.dim;      // FLOAT units, see write
+        std::memcpy(out, sl.f32.data() + fo, (size_t)sl.dim * sizeof(float));
         return;
     }
+    const int64_t off = (phys * sl.heads + head) * sl.vec_bytes();
+    const int64_t so = phys * sl.heads + head;
     if (sl.dt == KvDType::INT8) {
         for (int64_t i = 0; i < sl.dim; ++i) out[i] = float(sl.i8[off + i]) * sl.scale[so];
         return;
