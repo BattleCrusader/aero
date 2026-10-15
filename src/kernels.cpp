@@ -105,8 +105,8 @@ inline float q5k_block_dot(const uint8_t* blk, const float* x) {
             const uint8_t byte = qs[col + i];
             const float xlo = x[j + i];
             const float xhi = x[j + 32 + i];
-            const int h1 = (qh[i] >> (2 * is)) & 1;
-            const int h2 = (qh[i] >> (2 * is + 1)) & 1;
+            const int h1 = (qh[i] >> is) & 1;
+            const int h2 = (qh[i] >> (is + 1)) & 1;
             qx1 += static_cast<float>((byte & 0x0F) | (h1 << 4)) * xlo;
             sx1 += xlo;
             qx2 += static_cast<float>((byte >> 4) | (h2 << 4)) * xhi;
@@ -391,8 +391,8 @@ bool dequant_ref(DType t, const uint8_t* raw, int64_t raw_len, float* out,
                 const float g2 = dmin * static_cast<float>(m2);
                 for (int i = 0; i < 32; ++i) {
                     const uint8_t byte = qs[col + i];
-                    const int h1 = (qh[i] >> (2 * is)) & 1;
-                    const int h2 = (qh[i] >> (2 * is + 1)) & 1;
+                    const int h1 = (qh[i] >> is) & 1;
+                    const int h2 = (qh[i] >> (is + 1)) & 1;
                     o[j + i]      = f1 * static_cast<float>((byte & 0x0F) | (h1 << 4)) - g1;
                     o[j + 32 + i] = f2 * static_cast<float>((byte >> 4) | (h2 << 4)) - g2;
                 }

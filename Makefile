@@ -266,6 +266,7 @@ test-model: check-py
 		$(PY) -W error::RuntimeWarning tests/test_hook_guard.py 2>&1 | tail -8; echo; \
 		$(PY) -W error::RuntimeWarning tests/test_plan_footprint.py 2>&1 | tail -8; echo; \
 		$(PY) -W error::RuntimeWarning tests/test_quant_native_extra.py 2>&1 | tail -8; echo; \
+		$(PY) tests/test_quant_oracle.py 2>&1 | tail -14; echo; \
 		$(PY) -W error::RuntimeWarning tests/test_model.py; echo; \
 		AERO_SKIP_SLOW=1 $(PY) -W error::RuntimeWarning tests/test_kv.py 2>&1 | tail -25; echo; \
 		AERO_SKIP_SLOW=1 $(PY) -W error::RuntimeWarning tests/test_prerope.py 2>&1 | tail -20; echo; \

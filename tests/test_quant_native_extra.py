@@ -101,6 +101,51 @@ for label, type_id, block_bytes, block_vals in (
     except (ValueError, OSError):
         check(True, "a short buffer is refused (no unbounded read)")
 
+print("\n[b2] Q5_K: the 5th bit is qh[position] bit SUB-BLOCK, and nowhere else")
+import numpy as _np  # noqa: E402
+from engine import quant as _EQ  # noqa: E402
+# THE BUG THIS PINS. qh is indexed by the position WITHIN the 32-wide half and reused
+# for all four 64-groups, and the mask bit is the sub-block index (0..7). A mask of
+# `2*is` instead of `is` agrees for sub-block 0 and is wrong for every later group --
+# which is what shipped: Ornith's whole attention stack (32 Q5_K attn_qkv tensors)
+# came out ~62% wrong (rel 0.624 vs the ggml authors' own dequantizer, first bad index
+# in sub-block 6). The old test missed it because it built its blocks with the SAME
+# wrong formula; this one is a fingerprint that only the right layout passes.
+_base = bytearray(176)
+_base[0:2] = _np.float16(1.0).tobytes()          # d
+_base[2:4] = _np.float16(0.0).tobytes()          # dmin
+_base[4:16] = b"\x01" * 12                      # scales (any nonzero)
+for _i in range(48, 176):
+    _base[_i] = 0x11                             # qs: nibble 1 everywhere
+_zero = bytes(_base)                             # qh all zero
+y0 = _np.asarray(_EQ.dequantize(_zero, 13, (256,)), dtype=_np.float32)
+
+
+def _with_bit(qh_index, bit):
+    b = bytearray(_base)
+    b[16 + qh_index] |= (1 << bit)
+    return bytes(b)
+
+
+# weight w = sub_block*32 + p  ->  qh[p], bit = sub_block
+for sb, p_ in ((2, 5), (6, 0), (7, 31)):
+    y1 = _np.asarray(_EQ.dequantize(_with_bit(p_, sb), 13, (256,)), dtype=_np.float32)
+    d = _np.abs(y1 - y0)
+    hit = _np.nonzero(d)[0]
+    want = sb * 32 + p_
+    check(list(hit) == [want],
+          "qh[%d] bit %d moves weight %d (sub-block %d) and nothing else -- got %s"
+          % (p_, sb, want, sb, list(hit)[:4] or "nothing"))
+    check(abs(float(d[want])) > 0, "the move is a real +16 step, not a rounding blip")
+# and the mirror: bit 6 must NOT move sub-block 3 (what `2*is` got wrong)
+_y2 = _np.asarray(_EQ.dequantize(_with_bit(3, 6), 13, (256,)), dtype=_np.float32)
+check(list(_np.nonzero(_np.abs(_y2 - y0))[0]) == [195],
+      "bit 6 from qh[3] hits weight 195, never weight 99 (the 2*is confusion)")
+_cpp = open(ROOT + "/src/kernels.cpp").read()
+check("(qh[i] >> is) & 1" in _cpp and "(qh[i] >> (is + 1)) & 1" in _cpp,
+      "the C++ fused path uses the same sub-block mask as the Python reference")
+check("2 * is" not in _cpp, "no `2 * is` mask survives anywhere in the C++")
+
 print("\n[c] the ternary types stay unimplemented, deliberately")
 for t, name in ((142, "PQ2_0"), (143, "PTQ1_0")):
     check(t not in NK.NATIVE_TYPES,

@@ -201,8 +201,13 @@ def _deq_q5_k(raw: bytes, n: int) -> np.ndarray:
         g2 = (dmin * m2.astype(np.float32))[:, None]
         blk = qs[:, col:col + 32]
         # 5th bit for the two halves of this 64-block
-        h1 = ((qh >> (2 * is_)) & 1).astype(np.uint8)
-        h2 = ((qh >> (2 * is_ + 1)) & 1).astype(np.uint8)
+        # qh is indexed by the position WITHIN the 32-wide half (same 32 bytes
+        # reused for every 64-group) and the mask bit is the SUB-BLOCK index:
+        #   group j=0/64/128/192 -> masks 1,4,16,64 (bits 0,2,4,6) and 2,8,32,128 (1,3,5,7)
+        # so with is_ advancing by 2 the bit is `is_`, NOT `2*is_`. Using 2*is_ picked
+        # bits 0,4,8,12: identical for is_=0, wrong for every later group.
+        h1 = ((qh >> is_) & 1).astype(np.uint8)
+        h2 = ((qh >> (is_ + 1)) & 1).astype(np.uint8)
         out[:, j:j + 32] = f1 * ((blk & 0x0F) | (h1 << 4)) - g1
         out[:, j + 32:j + 64] = f2 * ((blk >> 4) | (h2 << 4)) - g2
         col += 32
