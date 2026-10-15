@@ -448,7 +448,13 @@ class GgufRuntime(ModelRuntime):
                 yield f"\n[stopped: measured footprint exceeded --max-ram]"
                 return
             nxt = int(sample(logits, sp, rng))
-            yield self.detokenize([nxt]) + " "
+            # NO SPACE IS ADDED HERE. Byte-level BPE tokens carry their own leading
+            # space already (token 'ĠParis' decodes to ' Paris'; 'Ġcapital' to ' capital'),
+            # so appending one after every token injects a stray space into the stream --
+            # the reason this printed ' \n  \n' where the model emitted '\n\n', and why
+            # ' Paris' would have come out as ' Paris '. The tokenizer is the only thing
+            # that decides spacing; the generation loop must not add any.
+            yield self.detokenize([nxt])
             if self._native_loop is not None:
                 logits = self._forward_via_native([nxt])
             else:
