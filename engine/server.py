@@ -285,6 +285,15 @@ def main(argv=None) -> int:
         return 2
 
     runtime = make_runtime(a.runtime)
+    # --use-cpu is the CPU budget the COMPUTE path is allowed: the C++ block loop
+    # takes it as its thread count. Without this the flags parsed, built a plan
+    # that was printed, and were then dropped on the floor -- the plan never
+    # reached the code that multiplies. (gpu/ane counts are RECORDED but cannot
+    # drive compute yet: no Metal/ANE kernel exists behind the C++ loop, and
+    # multi-device splitting was measured SLOWER -- 0.56x CPU+GPU, 0.89x GPU+ANE --
+    # so a split here would be a regression, not a feature.)
+    if a.use_cpu is not None:
+        runtime.threads = max(1, int(a.use_cpu))
     try:
         runtime.load(a.model)
     except NotImplementedError as e:
