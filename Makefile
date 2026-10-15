@@ -284,6 +284,13 @@ test-cpp: all
 	@echo
 	@./$(BUILD)/test_model_cpp
 	@echo
+# The ANE runtime, in the gate. It loads a real compiled model through libaero_ane on the
+# CPU_AND_NE (Neural Engine) path and reads the model description back -- the load/validate
+# half of the ANE path, exercised every gate run, entirely Python-free. No model on this
+# machine has multi-array I/O, so PREDICT cannot be exercised yet; the suite prints each
+# refusal with its reason rather than claiming a matmul ran. Gate-safe by construction: a
+# refusal contributes no failures, so an absent model cannot turn the gate red.
+	@./$(BUILD)/test_ane_cpp "$${AERO_ANE_PROBE:-/System/Library/CoreServices/MapsSuggestionsTransportModePrediction.mlmodelc}" 2>&1 | tail -12; echo
 	@if [ -f "$(REAL_MODEL)" ]; then \
 		AERO_MAX_RAM=$${AERO_MAX_RAM:-5G} ./$(BUILD)/test_gguf "$(REAL_MODEL)"; \
 	 else echo "gguf test: SKIPPED (no $(REAL_MODEL))"; fi
