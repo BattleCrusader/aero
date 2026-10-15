@@ -255,6 +255,19 @@ bool ModelNative::qwen_block(int layer, int T) {
             return false;
     }
 
+    // Localise a non-finite activation to the layer and hook that produced it. Silent
+    // unless AERO_HOOK_DEBUG is set -- this runs per layer per token.
+    if (std::getenv("AERO_HOOK_DEBUG")) {
+        const int64_t nv = (int64_t)T * g_.n_embd;
+        for (int64_t k = 0; k < nv; ++k) {
+            if (!std::isfinite(o_[k])) {
+                std::fprintf(stderr, "block L%d kind=%d T=%d: hook output non-finite at %lld\n",
+                             layer, layers_[layer].kind, (int)T, (long long)k);
+                break;
+            }
+        }
+    }
+
     if (g_.block_on_output) {
         // post_attention_norm normalises the ATTENTION OUTPUT; the MLP runs on
         // that; the single residual add comes after. (The other reading keeps
