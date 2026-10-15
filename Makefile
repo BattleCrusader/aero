@@ -20,7 +20,7 @@ PYTESTS := $(wildcard tests/test_*.py)
 .PHONY: all test test-cpp test-engine test-server test-wrappers demo probe test-cached test-cache-status \
         test-cache-clear check-py kernels guard engine-cpp clean
 
-all: $(BUILD)/test_memory_guard $(BUILD)/test_metal_guard $(BUILD)/aero-load-demo $(BUILD)/aero-bwprobe $(BUILD)/test_kernels $(BUILD)/test_tensor $(BUILD)/test_ssm_cpp $(BUILD)/test_gguf $(BUILD)/test_transformer $(KLIB) $(SLIB) $(XLIB) $(TLIB) $(MLIB) $(KVLIB) $(BUILD)/test_model_cpp
+all: $(BUILD)/test_memory_guard $(BUILD)/test_metal_guard $(BUILD)/aero-load-demo $(BUILD)/aero-bwprobe $(BUILD)/test_kernels $(BUILD)/test_tensor $(BUILD)/test_ssm_cpp $(BUILD)/test_gguf $(BUILD)/test_transformer $(KLIB) $(SLIB) $(XLIB) $(TLIB) $(MLIB) $(KVLIB) $(BUILD)/test_model_cpp $(ATTLIB)
 
 # ---- native kernels ----
 # The test binary links the kernel TU directly, so `make test-cpp` proves the
@@ -62,6 +62,23 @@ $(KVLIB): $(KVSRC) $(KVHDR)
 
 kv-lib: $(KVLIB)
 	@echo "native kv primitives: $(KVLIB)"
+
+# ---- native attention layer ----
+# Needs kv.cpp (the native KV slots it writes through), kernels.cpp (fused
+# quantised projections), tensor.cpp (norms, softmax) and transformer.cpp
+# (rope_tables + attention_tiled). This was built by hand once and left without a
+# rule, so a clean checkout could not reproduce it.
+ATTLIB := $(BUILD)/libaero_attn.dylib
+ATTSRC := src/attention_layer.cpp
+ATTHDR := include/aero/attention_layer.hpp
+
+$(ATTLIB): $(ATTSRC) $(KVSRC) $(KSRC) $(TSRC) $(XSRC) $(ATTHDR) $(KVHDR) $(KHDR) $(THDR) $(XHDR)
+	@mkdir -p $(BUILD)
+	$(CXX) -std=c++17 $(CXXFLAGS) -shared $(ATTSRC) $(KVSRC) $(KSRC) $(TSRC) $(XSRC) \
+		-o $@ -pthread
+
+attn-lib: $(ATTLIB)
+	@echo "native attention layer: $(ATTLIB)"
 
 $(BUILD)/test_tensor: $(TSRC) tests/test_tensor.cpp $(THDR)
 	@mkdir -p $(BUILD)
@@ -230,6 +247,7 @@ test-model: check-py
 		$(PY) -W error::RuntimeWarning tests/test_ssm_native.py 2>&1 | tail -40; echo; \
 		$(PY) -W error::RuntimeWarning tests/test_ssm_native_q.py 2>&1 | tail -12; echo; \
 		$(PY) -W error::RuntimeWarning tests/test_ssm_hook.py 2>&1 | tail -10; echo; \
+		$(PY) -W error::RuntimeWarning tests/test_attn_native.py 2>&1 | tail -10; echo; \
 		$(PY) -W error::RuntimeWarning tests/test_model.py; echo; \
 		AERO_SKIP_SLOW=1 $(PY) -W error::RuntimeWarning tests/test_kv.py 2>&1 | tail -25; echo; \
 		AERO_SKIP_SLOW=1 $(PY) -W error::RuntimeWarning tests/test_prerope.py 2>&1 | tail -20; echo; \
