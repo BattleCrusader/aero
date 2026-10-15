@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import ctypes
 import os
+import sys
 from ctypes import (POINTER, CFUNCTYPE, c_char_p, c_float, c_int, c_int32,
                     c_int64, c_void_p, byref)
 
@@ -43,6 +44,31 @@ SSM_FN = CFUNCTYPE(c_int, c_void_p, c_int, POINTER(c_float), c_int, c_int,
                    POINTER(c_float))
 MOE_FN = SSM_FN
 
+
+
+def _guard(name: str, fn):
+    """Wrap a ctypes callback so a Python exception cannot be SWALLOWED.
+
+    ctypes prints "Exception ignored in ..." and discards the exception: the C side
+    reads the callback's default return (0 for an int) and the model produces wrong
+    numbers with no traceback anywhere. That has cost three debugging rounds in this
+    project. Returning 0 is the correct signal -- aero_model_forward treats a hook's
+    0 as refusal and the whole forward fails loudly in Python, where it can be seen.
+    """
+    def wrapper(*args):
+        try:
+            return fn(*args)
+        except BaseException as e:            # noqa: BLE001 -- must not escape
+            import traceback
+            _HOOK_ERRORS.append((name, repr(e)))
+            print(f"[native_model] {name} hook FAILED: {type(e).__name__}: {e}",
+                  file=sys.stderr)
+            traceback.print_exc()
+            return 0
+    return wrapper
+
+
+_HOOK_ERRORS: list = []
 
 class ModelLibUnavailable(RuntimeError):
     """libaero_model is not built. Callers must fall back, not guess."""
@@ -148,13 +174,13 @@ class NativeBlockLoop:
 
         # Hold references for the lifetime of the object: ctypes does not keep
         # CFUNCTYPE objects alive across calls, and a collected callback = crash.
-        self._attn_cb = ATTN_FN(attn_hook)
+        self._attn_cb = ATTN_FN(_guard("attn", attn_hook))
         if ssm_hook is not None:
-            self._ssm_cb = SSM_FN(ssm_hook)
+            self._ssm_cb = SSM_FN(_guard("ssm", ssm_hook))
         else:
             self._ssm_cb = None
         if moe_hook is not None:
-            self._moe_cb = MOE_FN(moe_hook)
+            self._moe_cb = MOE_FN(_guard("moe", moe_hook))
         else:
             self._moe_cb = None
 

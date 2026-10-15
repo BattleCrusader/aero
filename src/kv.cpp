@@ -3,6 +3,8 @@
 // order, ring rotation, the append/commit split).
 #include "aero/kv.hpp"
 
+#include <new>
+
 extern "C" {
 
 // ---- quantise one vector -------------------------------------------------
@@ -78,6 +80,54 @@ int aero_kv_span_error(int dt, const void* q, const float* scale, int64_t dim,
     }
     delete[] back;
     *out = maxerr / (xmax > 0.0f ? xmax : 1e-9f);
+    return 1;
+}
+
+// ---- slot lifetime + access ----------------------------------------------
+// The attention layer (src/attention_layer.cpp) takes KvSlot* and writes/reads
+// through them, so the runtime needs a way to own slots without seeing a C++ type.
+// These are the allocator and the accessors; the struct stays opaque (void*).
+//
+// dt: 0 = fp32, 1 = int8, 2 = int4-packed. `ring` marks a sliding-window slot, whose
+// physical layout wraps and whose reads must be rotated by (end % cap).
+void* aero_kv_slot_new(int64_t cap, int64_t heads, int64_t dim, int dt, int ring) {
+    if (cap <= 0 || heads <= 0 || dim <= 0 || dt < 0 || dt > 2) return nullptr;
+    if (dt == 2 && (dim % 2)) return nullptr;      // int4 packs pairs
+    auto* sl = new (std::nothrow) aero::KvSlot();
+    if (!sl) return nullptr;
+    sl->cap = cap;
+    sl->heads = heads;
+    sl->dim = dim;
+    sl->dt = static_cast<aero::KvDType>(dt);
+    sl->ring = ring != 0;
+    const int64_t vecs = cap * heads;
+    if (dt == 0) sl->f32.assign(static_cast<size_t>(vecs * dim), 0.0f);
+    else if (dt == 1) sl->i8.assign(static_cast<size_t>(vecs * dim), 0);
+    else sl->i4.assign(static_cast<size_t>(vecs * (dim / 2)), 0);
+    if (dt != 0) sl->scale.assign(static_cast<size_t>(vecs), 0.0f);
+    return sl;
+}
+
+void aero_kv_slot_free(void* s) { delete static_cast<aero::KvSlot*>(s); }
+
+int64_t aero_kv_slot_bytes(void* s) {
+    auto* sl = static_cast<aero::KvSlot*>(s);
+    return sl ? sl->bytes() : -1;
+}
+
+// Write one (position, head) vector at a PHYSICAL index (the ring wrap is the
+// caller's business, exactly as in the Python _write_side spans).
+int aero_kv_slot_write(void* s, int64_t phys, const float* x) {
+    auto* sl = static_cast<aero::KvSlot*>(s);
+    if (!sl || !x || phys < 0 || phys >= sl->cap) return 0;
+    aero::kv_slot_write(*sl, phys, x);
+    return 1;
+}
+
+int aero_kv_slot_read(void* s, int64_t phys, float* out) {
+    auto* sl = static_cast<aero::KvSlot*>(s);
+    if (!sl || !out || phys < 0 || phys >= sl->cap) return 0;
+    aero::kv_slot_read(*sl, phys, out);
     return 1;
 }
 
