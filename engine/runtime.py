@@ -220,6 +220,29 @@ class GgufRuntime(ModelRuntime):
                                           k_dtype=self.k_dtype,
                                           v_dtype=self.v_dtype)
 
+        # ---- the native block loop (AERO_NATIVE_LOOP, default 1) -------------
+        # The C++ block loop owns the per-layer wiring; attention/SSM/MoE arrive
+        # through hooks backed by the same Python primitives, so behaviour is
+        # identical and each hook can move to its native implementation
+        # independently afterwards. Falls back to the Python loop when the dylib is
+        # not built, and SAYS SO in the load stats rather than silently choosing.
+        self._native_loop = None
+        self._native_error = None
+        self._native_vocab = 0
+        if os.environ.get("AERO_NATIVE_LOOP", "1") == "1":
+            try:
+                from . import native_model as NM
+                self._native_loop, self._native_vocab = self._build_native_loop(NM)
+            except Exception as e:            # missing lib, refused geometry...
+                self._native_loop = None
+                self._native_error = type(e).__name__ + ": " + str(e)
+            self._load_stats["native_block_loop"] = self._native_loop is not None
+            if self._native_loop is None:
+                self._load_stats["native_block_loop_error"] = self._native_error
+        else:
+            self._load_stats["native_block_loop"] = False
+            self._load_stats["native_block_loop_error"] = "disabled by AERO_NATIVE_LOOP=0"
+
         # the tokenizer is what turns ids into text; without it the runtime can
         # only report numbers, so load it and say clearly if it is absent.
         tok_err = None
@@ -292,6 +315,17 @@ class GgufRuntime(ModelRuntime):
                 "merges": len(t.bpe_ranks), "specials": len(t._special),
                 "eos_id": t.eos_id}
 
+    # ---- the native block loop -------------------------------------------
+    def _build_native_loop(self, native_model_module):
+        """Open the C++ block loop with hook-backed layers.
+
+        Returns (loop, vocab). Raises on refusal so load() records WHY; this
+        runtime never pretends the native path is active.
+        """
+        from .native_loop import build_native_loop
+        loop = build_native_loop(self)
+        return loop, loop.vocab
+
     def generate(self, messages: List[Dict[str, str]],
                  params: GenParams) -> Iterator[str]:
         if self.model is None:
@@ -310,7 +344,13 @@ class GgufRuntime(ModelRuntime):
                           top_k=params.top_k, top_p=params.top_p,
                           seed=params.seed)
 
-        logits = self.model.forward(prompt, self.state)
+        # the forward: through the C++ block loop when it is available (hooks
+        # supply attention/SSM/MoE from the verified Python primitives), else
+        # the verified Python loop. The choice is recorded in load stats.
+        if self._native_loop is not None:
+            logits = self._forward_via_native(prompt)
+        else:
+            logits = self.model.forward(prompt, self.state)
         for _ in range(params.max_tokens):
             # (3) measured monitor between tokens -- if the footprint has grown
             # past the cap mid-generation, stop cleanly instead of dying.
@@ -319,7 +359,21 @@ class GgufRuntime(ModelRuntime):
                 return
             nxt = int(sample(logits, sp, rng))
             yield self.detokenize([nxt]) + " "
-            logits = self.model.forward([nxt], self.state)
+            if self._native_loop is not None:
+                logits = self._forward_via_native([nxt])
+            else:
+                logits = self.model.forward([nxt], self.state)
+
+    def _forward_via_native(self, tokens):
+        """One pass through the C++ block loop. Returns (vocab,) logits."""
+        import numpy as np
+        logits = np.zeros(self._native_vocab, dtype=np.float32)
+        positions = np.arange(self.state.pos, self.state.pos + len(tokens),
+                              dtype=np.int64)
+        self._native_loop.forward(tokens, positions, logits)
+        self.state.kv.commit(len(tokens))
+        self.state.pos += len(tokens)
+        return logits
 
     def stats(self) -> dict:
         d = dict(self._load_stats)

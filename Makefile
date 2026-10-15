@@ -221,6 +221,7 @@ test-model: check-py
 		$(PY) -W error::RuntimeWarning tests/test_chat_template.py 2>&1 | tail -12; echo; \
 		$(PY) -W error::RuntimeWarning tests/test_pread.py 2>&1 | tail -14; echo; \
 		$(PY) -W error::RuntimeWarning tests/test_tensor_native.py 2>&1 | tail -10; echo; \
+		$(PY) -W error::RuntimeWarning tests/test_native_loop.py 2>&1 | tail -8; echo; \
 		$(PY) -W error::RuntimeWarning tests/test_dequant_threads.py 2>&1 | tail -8; echo; \
 		$(PY) -W error::RuntimeWarning tests/test_native.py 2>&1 | tail -25; echo; \
 		$(PY) tests/test_transformer_native.py 2>&1 | tail -60; echo; \
