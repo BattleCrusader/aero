@@ -31,7 +31,7 @@ with GGUFReader(P) as r:
     rng = np.random.default_rng(7)
     H5 = np.ascontiguousarray(rng.standard_normal((5,NE)).astype(np.float32)*0.5)
     def bad(a): return int((~np.isfinite(a)).sum())
-    def fresh(): return np.zeros((K-1,QW),np.float32), np.zeros((NG,DS,DS),np.float32)
+    def fresh(): return np.zeros((K-1,QW),np.float32), np.zeros((TR,DS,DS),np.float32)
     def call(h,tail,tl,gdn,T):
         o = np.zeros((T,NE),np.float32)
         rc = L.aero_ssm_forward_q(h.ctypes.data_as(F),dt_arr,ptr_arr,len_arr,
