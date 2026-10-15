@@ -27,7 +27,10 @@ NOT specify, and which would silently produce garbage if wrong:
   2. **The output gate is silu(gate) * norm(o)**, applied before `ssm_out`.
   3. **The conv is causal and depthwise** over the fused qkv channels, with
      kernel = ssm.conv_kernel.
-  4. **v-head h reads k-head h // (n_v_heads // n_k_heads)** -- grouping direction
+  4. **v-head h reads k-head h % n_k_heads** -- llama.cpp TILES q/k up to the v-head
+     count (ggml_repeat_4d), which is CYCLIC. h // ratio is a different function
+     (it was the original bug). VERIFIED against PrismML-llama.cpp
+     src/models/qwen35.cpp + delta-net-base.cpp: no longer an assumption.
      (which v-heads share a k-head) is convention, not data.
 
 Each is isolated in a small named function so it can be flipped in one place once
