@@ -241,5 +241,54 @@ else:
     kvlib.aero_kv_slot_free(k_sl)
     kvlib.aero_kv_slot_free(v_sl)
 
+
+# ---------------------------------------------------------------------------
+# [3] THE INVARIANT THE NATIVE PATH FAILS. Prefill n tokens into a slot, then decode one
+# more at position n, must equal feeding all n+1 in a single call. The C++ model path misses
+# this by 23.7 logits (the Python path holds it to 2e-05), so the layer itself is the place
+# to localise it: same tensors, same weights, only the call pattern differs.
+print("\n[3] prefill + decode == one-shot prefill (the state path)")
+k5 = kvlib.aero_kv_slot_new(16, HK, D, 0, 0)
+v5 = kvlib.aero_kv_slot_new(16, HK, D, 0, 0)
+
+
+def run_slots(Tt, pos_list, kvp, kslot, vslot):
+    out = np.zeros((Tt, NE), np.float32)
+    rc = lib.aero_attention_qwen(
+        x5.ctypes.data_as(POINTER(c_float)), Tt, NE,
+        np.array(pos_list, np.int32).ctypes.data_as(POINTER(c_int32)),
+        native_dt(q_info.type_id), q_b, q_info.shape[0], 1,
+        native_dt(k_info.type_id), k_b, k_info.shape[0],
+        native_dt(v_info.type_id), v_b, v_info.shape[0],
+        native_dt(o_info.type_id), o_b, o_info.shape[0],
+        qn.ctypes.data_as(POINTER(c_float)), kn.ctypes.data_as(POINTER(c_float)),
+        0, 1e-6, 1e7, 64, None, 0,
+        H, HK, D, D, 0.0, 0, 1, 8,
+        ctypes.c_void_p(kslot), ctypes.c_void_p(vslot), kvp,
+        out.ctypes.data_as(POINTER(c_float)))
+    return rc, out
+
+
+# five tokens of real input, one shot into a fresh slot
+x5 = np.concatenate([x] * 5, axis=0).astype(np.float32)
+rcA, outA = run_slots(5, [0, 1, 2, 3, 4], 0, k5, v5)
+check(rcA == 1, "one-shot prefill of 5 tokens succeeded")
+
+# four tokens, then the fifth decoded at position 4, into another fresh slot
+k6 = kvlib.aero_kv_slot_new(16, HK, D, 0, 0)
+v6 = kvlib.aero_kv_slot_new(16, HK, D, 0, 0)
+x4 = np.concatenate([x] * 4, axis=0).astype(np.float32)
+rcB, outB4 = run_slots(4, [0, 1, 2, 3], 0, k6, v6)
+rcC, outC = run_slots(1, [4], 4, k6, v6)
+check(rcB == 1 and rcC == 1, "prefill of 4 then a decode at position 4 both succeeded")
+
+d5 = float(np.abs(outA[4] - outC[0]).max())
+rel5 = d5 / max(float(np.abs(outA[4]).max()), 1e-9)
+print("       one-shot last token vs decoded last token: max|d| = %.4e  rel = %.3e" % (d5, rel5))
+check(rel5 < 1e-4,
+      "prefill+decode == one-shot prefill at the LAYER level (rel %.3e)" % rel5)
+kvlib.aero_kv_slot_free(k5); kvlib.aero_kv_slot_free(v5)
+kvlib.aero_kv_slot_free(k6); kvlib.aero_kv_slot_free(v6)
+
 print(f"\n=== {CHECKS} checks, {FAILS} failures ===")
 sys.exit(1 if FAILS else 0)
