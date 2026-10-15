@@ -117,6 +117,38 @@ int main(int argc, char** argv) {
               "top-1 is the answer the Python path produced (Paris, 11751)");
         check(logits[EXPECTED_TOP1] > 5.0f, "and its logit is decisive, not a coin flip");
 
+        // ISOLATE THE STATE PATH. The C++ hooks keep their own KV slots and drive them with
+        // kv_phys = pos[0]; the Python hook passes NULL slots and keeps a Python cache. So the
+        // invariant to test is the one that depends on that state being right: decoding one
+        // token at position n-1 after n-1 prefill tokens must give the SAME logits as feeding
+        // all n in one call. If it does not, the defect is the state/slot path, not the glue.
+        aero_model_t m3 = aero_model_open(path.c_str(), &g, lg.data(), err, (int)sizeof err);
+        if (m3) {
+            aero_model_prepare_state(m3, 512);
+            aero_model_use_native_hooks(m3);
+            std::vector<float> lA((size_t)aero_model_vocab(m3), 0.0f);
+            std::vector<int64_t> pA((size_t)(n - 1));
+            for (int64_t i = 0; i < n - 1; ++i) pA[(size_t)i] = i;
+            const int okA = aero_model_forward(m3, ids, (int)(n - 1), pA.data(), lA.data());
+            std::vector<float> lB((size_t)aero_model_vocab(m3), 0.0f);
+            int64_t pB[1] = {n - 1};
+            int32_t last[1] = {ids[n - 1]};
+            const int okB = aero_model_forward(m3, last, 1, pB, lB.data());
+            double dmax = 0.0;
+            int aA = 0, aB = 0;
+            for (size_t i = 0; i < lA.size(); ++i) {
+                dmax = std::max(dmax, (double)std::fabs(lA[i] - lB[i]));
+                if (lA[i] > lA[aA]) aA = (int)i;
+                if (lB[i] > lB[aB]) aB = (int)i;
+            }
+            std::printf("       incremental invariant: rc=%d/%d  max|prefill-decode|=%.3e  "
+                        "argmax %d vs %d\n", okA, okB, dmax, aA, aB);
+            check(okA == 1 && okB == 1, "both the prefill and the follow-on decode succeed");
+            check(dmax < 1e-3 && aA == aB,
+                  "decoding after a prefill matches the batch prefill (state path is consistent)");
+            aero_model_free(m3);
+        }
+
         // WHERE does it go wrong? A single-token forward isolates the per-step path from
         // the multi-token prefill, without adding any instrumentation to the engine.
         aero_model_t m2 = aero_model_open(path.c_str(), &g, lg.data(), err, (int)sizeof err);
