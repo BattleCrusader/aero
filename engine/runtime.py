@@ -239,6 +239,18 @@ class GgufRuntime(ModelRuntime):
             self._load_stats["native_block_loop"] = self._native_loop is not None
             if self._native_loop is None:
                 self._load_stats["native_block_loop_error"] = self._native_error
+                # THE ENGINE IS C++. Falling back to the Python loop would silently
+                # make the Python reference the thing that generates tokens, which is
+                # exactly what this engine is not. So: refuse, unless the caller asks
+                # for the POC path explicitly. A dev stub that quietly becomes the
+                # production path is how a port dies.
+                if os.environ.get("AERO_ALLOW_PY_FALLBACK", "0") != "1":
+                    raise RuntimeError(
+                        "the native C++ block loop is required for inference but could "
+                        "not be built: " + str(self._native_error) + "\n"
+                        "  build it with `make all` (needs build/libaero_model.dylib)\n"
+                        "  to run the PYTHON reference loop instead, set "
+                        "AERO_ALLOW_PY_FALLBACK=1 (POC/tests only)")
         else:
             self._load_stats["native_block_loop"] = False
             self._load_stats["native_block_loop_error"] = "disabled by AERO_NATIVE_LOOP=0"
