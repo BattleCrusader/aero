@@ -68,11 +68,13 @@ $(BUILD)/test_tensor: $(TSRC) tests/test_tensor.cpp $(THDR)
 	$(CXX) -std=c++17 $(CXXFLAGS) $(TSRC) tests/test_tensor.cpp -o $@ -pthread
 
 # ---- SSM (gated delta net) + MoE inner loops, and their Python binding ----
-# A separate library from the quantized kernels: this is fp32 arithmetic over
-# weights Python has already dequantised, so it must NOT be built with
-# -ffast-math (reassociation would break the fp32 match against numpy).
-SSMSRC := src/ssm.cpp src/moe.cpp
-SSMHDR := include/aero/ssm.hpp include/aero/moe.hpp
+# Links kernels.cpp: aero_ssm_forward_q reads QUANTISED SSM weights through the
+# fused dequant+matmul, so the fp32 weight never exists (147 MB vs 1025 MB on
+# Qwen3.8-4B -- 6.98x, and SSM+attention would be 5.4 GB of fp32 on a 6-8 GB box).
+# Still NOT built with -ffast-math: the fp32 paths must keep their fp32 match
+# against numpy, and reassociation would break it.
+SSMSRC := src/ssm.cpp src/moe.cpp src/kernels.cpp
+SSMHDR := include/aero/ssm.hpp include/aero/moe.hpp include/aero/kernels.hpp
 SLIB   := $(BUILD)/libaero_ssm.dylib
 
 $(SLIB): $(SSMSRC) $(SSMHDR)
@@ -226,6 +228,8 @@ test-model: check-py
 		$(PY) -W error::RuntimeWarning tests/test_optimizations.py; echo; \
 		$(PY) -W error::RuntimeWarning tests/test_ssm.py; echo; \
 		$(PY) -W error::RuntimeWarning tests/test_ssm_native.py 2>&1 | tail -40; echo; \
+		$(PY) -W error::RuntimeWarning tests/test_ssm_native_q.py 2>&1 | tail -12; echo; \
+		$(PY) -W error::RuntimeWarning tests/test_ssm_hook.py 2>&1 | tail -10; echo; \
 		$(PY) -W error::RuntimeWarning tests/test_model.py; echo; \
 		AERO_SKIP_SLOW=1 $(PY) -W error::RuntimeWarning tests/test_kv.py 2>&1 | tail -25; echo; \
 		AERO_SKIP_SLOW=1 $(PY) -W error::RuntimeWarning tests/test_prerope.py 2>&1 | tail -20; echo; \

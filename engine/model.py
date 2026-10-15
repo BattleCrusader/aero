@@ -326,6 +326,11 @@ class ModelState:
     ssm_states: dict          # layer -> SsmState
     gdn: dict                 # layer -> (n_v_heads, d, d)
     moe_cache: dict = field(default_factory=dict)   # layer -> {(tensor, expert): fp32}
+    # layer -> conv tail for the NATIVE SSM path. The Python path keeps its tail
+    # inside SsmState/ConvState; the native path needs the same persistence, and it
+    # must survive across calls or the depthwise conv sees a stale (or zero) history
+    # and the SSM produces plausible-but-wrong output.
+    ssm_tails: dict = field(default_factory=dict)
     pos: int = 0
 
     @property

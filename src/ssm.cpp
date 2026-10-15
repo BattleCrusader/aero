@@ -5,6 +5,7 @@
 // in the same operation order as the numpy reference, so the two agree to fp32
 // rounding (measured in tests/test_ssm_native.py).
 #include "aero/ssm.hpp"
+#include "aero/kernels.hpp"
 
 #include <cmath>
 #include <cstring>
@@ -40,6 +41,26 @@ void matvec_fp32(const float* w, const float* x, float* y, int n_out, int n_in) 
         for (int c = 0; c < n_in; ++c) s += wr[c] * x[c];
         y[r] = s;
     }
+}
+
+// The same matvec over a possibly-QUANTISED tensor.
+//
+// WHY THIS EXISTS: aero_ssm_forward used matvec_fp32 for every projection, which
+// forced the SSM weights to be fp32. Measured on Qwen3.8-4B, the SSM tensors are
+// 147 MB quantised and 1025 MB as fp32 -- 6.98x -- and SSM+attention would be 5.4 GB
+// of fp32 on a box whose ceiling is 6-8 GB. So the SSM path must read quantised
+// weights and dequantise INSIDE the dot product, exactly like aero_matmul does for
+// the FFN and attention projections.
+//
+// dt: 0 = F32 (plain path), otherwise the aero::DType id of the raw block tensor.
+void matvec_any(int dt, const void* w, const float* x, float* y, int n_out, int n_in,
+                int threads) {
+    if (dt == 0) {
+        matvec_fp32(static_cast<const float*>(w), x, y, n_out, n_in);
+        return;
+    }
+    matvec(static_cast<DType>(dt), static_cast<const uint8_t*>(w), x, y, n_out, n_in,
+           threads);
 }
 
 // The gated delta rule for one token, with q/k given as n_k heads and v as n_v
@@ -197,7 +218,57 @@ int aero_ssm_forward(const float* x,
                      int n_group, int conv_kernel, int time_step_rank,
                      float eps, float norm_eps,
                      float* conv_tail, int* tail_len,
+                     float* state, float* out);
+
+// Quantised-weight variant: the same maths, but each projection reads its weight
+// through a (dtype, pointer, byte-length) triple so the fused kernel dequantises
+// inside the dot product and the fp32 weight never exists. Order of the 5 entries:
+//   0 = qkv  1 = gate  2 = alpha  3 = beta  4 = out
+// dtype 0 means "fp32, use the pointer directly"; any other value is an aero::DType.
+int aero_ssm_forward_q(const float* x,
+                       const int* dts, const void* const* wptrs,
+                       const int64_t* wlens,
+                       const float* a_log, const float* dt_bias,
+                       const float* conv1d, const float* norm,
+                       int T, int n_embd, int inner_size, int state_size,
+                       int n_group, int conv_kernel, int time_step_rank,
+                       float eps, float norm_eps,
+                       float* conv_tail, int* tail_len,
+                       float* state, float* out, int threads);
+
+int aero_ssm_forward(const float* x,
+                     const float* w_qkv, const float* w_gate,
+                     const float* w_alpha, const float* w_beta,
+                     const float* a_log, const float* dt_bias,
+                     const float* conv1d, const float* norm, const float* w_out,
+                     int T, int n_embd, int inner_size, int state_size,
+                     int n_group, int conv_kernel, int time_step_rank,
+                     float eps, float norm_eps,
+                     float* conv_tail, int* tail_len,
                      float* state, float* out) {
+    // Every weight fp32: the descriptors below say so, and the shared implementation
+    // takes the plain matvec for each. One implementation, two entry points -- the
+    // alternative (a second copy of this file's maths for quantised weights) is how
+    // two code paths drift apart and one of them silently becomes wrong.
+    const int dts[5] = {0, 0, 0, 0, 0};
+    const void* ptrs[5] = {w_qkv, w_gate, w_alpha, w_beta, w_out};
+    const int64_t lens[5] = {0, 0, 0, 0, 0};
+    return aero_ssm_forward_q(x, dts, ptrs, lens, a_log, dt_bias, conv1d, norm,
+                              T, n_embd, inner_size, state_size, n_group,
+                              conv_kernel, time_step_rank, eps, norm_eps,
+                              conv_tail, tail_len, state, out, 1);
+}
+
+int aero_ssm_forward_q(const float* x,
+                       const int* dts, const void* const* wptrs,
+                       const int64_t* wlens,
+                       const float* a_log, const float* dt_bias,
+                       const float* conv1d, const float* norm,
+                       int T, int n_embd, int inner_size, int state_size,
+                       int n_group, int conv_kernel, int time_step_rank,
+                       float eps, float norm_eps,
+                       float* conv_tail, int* tail_len,
+                       float* state, float* out, int threads) {
     if (inner_size <= 0 || state_size <= 0 || n_group <= 0 || T < 0) return -1;
     if (inner_size % state_size != 0) return -1;
     const int n_v = inner_size / state_size;
@@ -205,6 +276,13 @@ int aero_ssm_forward(const float* x,
     if (n_v % n_k != 0) return -1;
     // delta_rule_step indexes alpha/beta by v-head, so the rank must match.
     if (time_step_rank != n_v) return -1;
+    if (!dts || !wptrs) return -1;
+    // wlens may be NULL for the fp32 entry point; when a quantised weight is
+    // supplied its byte length MUST be given, or the fused kernel cannot bound-check
+    // and could read past the tensor -- the crash class this repo has already had.
+    for (int k = 0; k < 5; ++k) {
+        if (dts[k] != 0 && (!wlens || wlens[k] <= 0)) return -1;
+    }
 
     const int q_width = n_k * state_size;
     const int kv_width = n_k * state_size;
@@ -215,9 +293,9 @@ int aero_ssm_forward(const float* x,
     // 1. fused projection + causal depthwise conv + silu
     std::vector<float> qkv(static_cast<size_t>(T) * qkv_width);
     for (int t = 0; t < T; ++t) {
-        aero::matvec_fp32(w_qkv, x + static_cast<size_t>(t) * n_embd,
-                          qkv.data() + static_cast<size_t>(t) * qkv_width,
-                          qkv_width, n_embd);
+        aero::matvec_any(dts[0], wptrs[0], x + static_cast<size_t>(t) * n_embd,
+                         qkv.data() + static_cast<size_t>(t) * qkv_width,
+                         qkv_width, n_embd, threads);
     }
     aero_ssm_conv(qkv.data(), conv1d, conv_tail, tail_len, qkv.data(), T,
                   qkv_width, conv_kernel);
@@ -228,13 +306,15 @@ int aero_ssm_forward(const float* x,
     std::vector<float> beta(static_cast<size_t>(T) * n_v);
     std::vector<float> gate(static_cast<size_t>(T) * inner_size);
     for (int t = 0; t < T; ++t) {
-        aero::matvec_fp32(w_alpha, x + static_cast<size_t>(t) * n_embd,
-                          alpha.data() + static_cast<size_t>(t) * n_v, n_v, n_embd);
-        aero::matvec_fp32(w_beta, x + static_cast<size_t>(t) * n_embd,
-                          beta.data() + static_cast<size_t>(t) * n_v, n_v, n_embd);
-        aero::matvec_fp32(w_gate, x + static_cast<size_t>(t) * n_embd,
-                          gate.data() + static_cast<size_t>(t) * inner_size,
-                          inner_size, n_embd);
+        aero::matvec_any(dts[2], wptrs[2], x + static_cast<size_t>(t) * n_embd,
+                         alpha.data() + static_cast<size_t>(t) * n_v, n_v, n_embd,
+                         threads);
+        aero::matvec_any(dts[3], wptrs[3], x + static_cast<size_t>(t) * n_embd,
+                         beta.data() + static_cast<size_t>(t) * n_v, n_v, n_embd,
+                         threads);
+        aero::matvec_any(dts[1], wptrs[1], x + static_cast<size_t>(t) * n_embd,
+                         gate.data() + static_cast<size_t>(t) * inner_size,
+                         inner_size, n_embd, threads);
     }
 
     // 3. recurrence scan over the packed q/k/v slices of qkv
@@ -264,8 +344,9 @@ int aero_ssm_forward(const float* x,
 
     // 5. output projection
     for (int t = 0; t < T; ++t) {
-        aero::matvec_fp32(w_out, o.data() + static_cast<size_t>(t) * inner_size,
-                          out + static_cast<size_t>(t) * n_embd, n_embd, inner_size);
+        aero::matvec_any(dts[4], wptrs[4], o.data() + static_cast<size_t>(t) * inner_size,
+                         out + static_cast<size_t>(t) * n_embd, n_embd, inner_size,
+                         threads);
     }
     return 0;
 }

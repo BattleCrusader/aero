@@ -46,6 +46,12 @@ int64_t rope_tables(int64_t head_dim, const int32_t* positions, int64_t n_pos,
         // convention): large factor -> angle ~0 -> pair left unrotated.
         if (freq_factors != nullptr) inv /= freq_factors[p];
         for (int64_t t = 0; t < n_pos; ++t) {
+            // ROW-addressed: row t = the t-th position REQUESTED. The angle uses
+            // the position VALUE (positions[t]); the row INDEX defines where it
+            // lands. Callers rope one token by passing a 1-entry list and
+            // advancing the table pointer; a strided position list must not be
+            // written at positions[t]*half (it would need a (max_pos+1)-row
+            // table AND made the [1] table tests write out of bounds).
             const float ang = (float)positions[t] * inv;
             cos_out[t * half + p] = std::cos(ang);
             sin_out[t * half + p] = std::sin(ang);
@@ -61,6 +67,10 @@ void apply_rope(float* x, int64_t n_rows, int64_t head_dim, int64_t n_rot,
     if (half <= 0 || head_dim <= 0) return;
     for (int64_t r = 0; r < n_rows; ++r) {
         float* xr = x + r * head_dim;
+                        // POSITION-indexed: row p = pos[r] of the table. The CALLER supplies a
+        // table covering every position it indexes (the tests build one with
+        // dense positions; attention_layer does the same). This is the one
+        // contract that satisfies both the tests and a strided position list.
         const int64_t pi = positions ? (int64_t)positions[r] : r;
         const float* c = cos_tab + pi * half;
         const float* s = sin_tab + pi * half;
