@@ -206,7 +206,12 @@ bool ModelNative::qwen_block(int layer, int T) {
         for (int64_t i = 0; i < T * n; ++i) x_[i] += d_[i];
     } else {
         for (int64_t i = 0; i < T * n; ++i) x_[i] += o_[i];
-        return true;
+        for (int64_t t = 0; t < T; ++t)
+            norm_row(x_.data() + t * n, pan_w, h_.data() + t * n, n, g_.eps);
+        if (!ffn(layer, T, h_.data(), d_.data())) return false;
+        for (int64_t i = 0; i < T * n; ++i) x_[i] += d_[i];
+    }
+    return true;
 }
 
 // ------------------------------------------------------------------ forward
@@ -243,7 +248,8 @@ bool ModelNative::forward(const int32_t* tokens, int n_tokens,
         const bool ok = (g_.arch == 0) ? gemma_block(layer, n_tokens)
                                        : qwen_block(layer, n_tokens);
         if (!ok) return false;
-    
+    }
+
     // ---- final norm + head, last position only
     const TensorInfo* on = r_->find("output_norm.weight");
     if (!on || on->type != GGMLType::F32) return false;
