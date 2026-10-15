@@ -116,7 +116,11 @@ def build_native_loop(rt):
     verified numerics.
     """
     from . import native_model as NM
-    from .chat_template import EnvelopeError  # noqa: F401  (re-exported error)
+    # NOTE: this used to import EnvelopeError from engine.chat_template purely to
+    # re-export it (unused, # noqa: F401). That ONE line put a Python module on the C++
+    # loop's import path, so a run with the Python prompt modules unimportable fell back
+    # to the Python reference loop -- caught by tests/test_native_prompt_only.py, which
+    # blocks those modules and watches for exactly this. Nothing here needs the class.
     cfg = rt.model.cfg
 
     g = _geom_from_cfg(rt)

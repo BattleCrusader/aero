@@ -22,11 +22,6 @@ from typing import Dict, Iterator, List, Optional, Tuple
 
 from .devices import DevicePlan
 
-try:                        # imported as engine.runtime (usual)
-    from .chat_template import render_chat
-except ImportError:        # pragma: no cover - run as a plain script
-    from engine.chat_template import render_chat
-
 
 @dataclass
 class GenParams:
@@ -243,6 +238,42 @@ class GgufRuntime(ModelRuntime):
                                           k_dtype=self.k_dtype,
                                           v_dtype=self.v_dtype)
 
+        # LOAD THE TOKENIZER FIRST -- the loop's geometry needs `vocab`.
+        #
+        # The order below was backwards, and it silently neutralised the whole C++ engine:
+        # _geom_from_cfg reads `rt.tokenizer.n_vocab` for the head, so building the loop
+        # BEFORE the tokenizer existed gave vocab=0, the loop refused with "no tokenizer;
+        # the native loop needs vocab for the head", and load() fell back to the Python
+        # reference loop -- on EVERY load, with only a stderr warning to say so. Every
+        # native module verified in this repo (attention, SSM, MoE, kernels) was therefore
+        # unreachable in the default path, and "both paths agree" meant "both are Python".
+        # A warning is not enough for this: tests/test_native_prompt_only.py now blocks the
+        # Python prompt modules and fails if the C++ loop cannot stand up without them.
+        # THE PROMPT PATH IS C++. The tokenizer and the chat renderer come from
+        # libaero_tokenizer/libaero_chat; engine/tokenizer.py and engine/chat_template.py
+        # are the ORACLES the tests compare against, not the implementation. Python is
+        # the fallback only when the libraries are absent or AERO_NATIVE_PROMPT=0, and
+        # which one is in use is recorded -- never silent.
+        tok_err = None
+        self.token_source = "native"
+        if os.environ.get("AERO_NATIVE_PROMPT", "1") == "0":
+            self.token_source = "python (AERO_NATIVE_PROMPT=0)"
+        try:
+            if self.token_source == "native":
+                from .native_prompt import NativeTokenizer
+                self.tokenizer = NativeTokenizer(self.path)
+            else:
+                from .tokenizer import Tokenizer
+                self.tokenizer = Tokenizer.from_gguf(self._reader)
+        except Exception as e:                      # missing lib, refused file...
+            self.token_source = "python (%s: %s)" % (type(e).__name__, e)
+            try:
+                from .tokenizer import Tokenizer
+                self.tokenizer = Tokenizer.from_gguf(self._reader)
+            except Exception as e2:
+                self.tokenizer = None
+                tok_err = f"{type(e2).__name__}: {e2}"
+
         # ---- the native block loop (AERO_NATIVE_LOOP, default 1) -------------
         # The C++ block loop owns the per-layer wiring; attention/SSM/MoE arrive
         # through hooks backed by the same Python primitives, so behaviour is
@@ -280,30 +311,6 @@ class GgufRuntime(ModelRuntime):
             self._load_stats["native_block_loop"] = False
             self._load_stats["native_block_loop_error"] = "disabled by AERO_NATIVE_LOOP=0"
 
-        # THE PROMPT PATH IS C++. The tokenizer and the chat renderer come from
-        # libaero_tokenizer/libaero_chat; engine/tokenizer.py and engine/chat_template.py
-        # are the ORACLES the tests compare against, not the implementation. Python is
-        # the fallback only when the libraries are absent or AERO_NATIVE_PROMPT=0, and
-        # which one is in use is recorded -- never silent.
-        tok_err = None
-        self.token_source = "native"
-        if os.environ.get("AERO_NATIVE_PROMPT", "1") == "0":
-            self.token_source = "python (AERO_NATIVE_PROMPT=0)"
-        try:
-            if self.token_source == "native":
-                from .native_prompt import NativeTokenizer
-                self.tokenizer = NativeTokenizer(self.path)
-            else:
-                from .tokenizer import Tokenizer
-                self.tokenizer = Tokenizer.from_gguf(self._reader)
-        except Exception as e:                      # missing lib, refused file...
-            self.token_source = "python (%s: %s)" % (type(e).__name__, e)
-            try:
-                from .tokenizer import Tokenizer
-                self.tokenizer = Tokenizer.from_gguf(self._reader)
-            except Exception as e2:
-                self.tokenizer = None
-                tok_err = f"{type(e2).__name__}: {e2}"
 
         self._load_stats = {
             "arch": arch,
@@ -320,6 +327,8 @@ class GgufRuntime(ModelRuntime):
             "kv_layers": self.state.kv.n_layers_cached if self.state.kv else 0,
             "tokenizer": self.token_info(),
             "token_source": self.token_source,
+            "native_block_loop": self._native_loop is not None,
+            "native_vocab": self._native_vocab,
         }
         if tok_err:
             self._load_stats["tokenizer_error"] = tok_err
@@ -354,6 +363,15 @@ class GgufRuntime(ModelRuntime):
                 raise RuntimeError(
                     "native chat renderer failed (%s: %s); set AERO_NATIVE_PROMPT=0 to "
                     "fall back to the Python renderer deliberately" % (type(e).__name__, e))
+        # LAST RESORT, and imported HERE so the native path never even loads the Python
+        # renderer. A module-level import would put Python on the engine's import path
+        # regardless of which renderer actually runs, which is not the same thing as
+        # "the engine is C++" and would have made the negative control in
+        # tests/test_native_prompt_only.py pass by accident.
+        try:
+            from .chat_template import render_chat
+        except ImportError:                       # pragma: no cover - plain script
+            from engine.chat_template import render_chat
         return render_chat(messages, self.tokenizer,
                            add_generation_prompt=add_generation_prompt,
                            enable_thinking=enable_thinking)

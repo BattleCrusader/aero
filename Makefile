@@ -290,6 +290,7 @@ test-model: all check-py
 		$(PY) tests/test_attn_native.py 2>&1 | tail -14; echo; \
 		$(PY) tests/test_tokenizer_cpp.py 2>&1 | tail -10; echo; \
 		$(PY) tests/test_chat_template_cpp.py 2>&1 | tail -10; echo; \
+		$(PY) tests/test_native_prompt_only.py 2>&1 | tail -12; echo; \
 		$(PY) -W error::RuntimeWarning tests/test_quant_native_extra.py 2>&1 | tail -8; echo; \
 		$(PY) tests/test_quant_oracle.py 2>&1 | tail -14; echo; \
 		$(PY) -W error::RuntimeWarning tests/test_model.py; echo; \
