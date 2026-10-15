@@ -12,6 +12,11 @@
 #include "aero/tensor.hpp"
 #include "aero/kv.hpp"
 #include "aero/ssm.hpp"
+#include "aero/attention_layer.hpp"
+#include <cstdio>
+#include <cstdlib>
+// Silent by default: a hook runs per layer per token and must never print.
+#define HOOK_DBG(...) do { if (std::getenv("AERO_HOOK_DEBUG")) std::fprintf(stderr, __VA_ARGS__); } while (0)
 
 namespace aero {
 namespace {
@@ -386,9 +391,10 @@ int aero_model_forward(aero_model_t m, const int32_t* tokens, int n_tokens,
 // with dts[k] the GGUF type id and wlens[k] the BYTE length -- a quantised descriptor with
 // no length is refused by the primitive rather than read unbounded.
 bool aero::ModelNative::native_ssm(int layer, const float* h, int T, int n_embd, float* out) {
-    if (layer < 0 || (size_t)layer >= state_.size()) return false;
+    HOOK_DBG("ssm L%d: enter\n", layer);
+    if (layer < 0 || (size_t)layer >= state_.size()) { HOOK_DBG("ssm L%d: layer out of range\n", layer); return false; }
     LayerState& st = state_[layer];
-    if (st.ssm_state.empty() || st.ssm_tail.empty()) return false;   // prepare_state first
+    if (st.ssm_state.empty() || st.ssm_tail.empty()) { HOOK_DBG("ssm L%d: state not prepared\n", layer); return false; }
 
     const std::string p = blk(layer);
     static const char* kNames[5] = {"attn_qkv.weight", "attn_gate.weight",
@@ -398,7 +404,7 @@ bool aero::ModelNative::native_ssm(int layer, const float* h, int T, int n_embd,
     int dts[5] = {0, 0, 0, 0, 0};
     for (int k = 0; k < 5; ++k) {
         const TensorInfo* ti = r_->find(p + kNames[k]);
-        if (!ti) return false;
+        if (!ti) { HOOK_DBG("ssm L%d: missing %s\n", layer, kNames[k]); return false; }
         wptrs[k] = r_->tensor_data(*ti);
         wlens[k] = r_->tensor_bytes(*ti);
         dts[k]   = (int)ti->type;
@@ -411,20 +417,108 @@ bool aero::ModelNative::native_ssm(int layer, const float* h, int T, int n_embd,
     const float* dt_bias = fp32("ssm_dt.bias");
     const float* conv1d  = fp32("ssm_conv1d.weight");
     const float* norm    = fp32("ssm_norm.weight");
-    if (!a_log || !dt_bias || !conv1d || !norm) return false;
+    if (!a_log || !dt_bias || !conv1d || !norm) {
+        HOOK_DBG("ssm L%d: fp32 side missing (a=%p dt=%p conv=%p norm=%p)\n",
+                 layer, (const void*)a_log, (const void*)dt_bias, (const void*)conv1d, (const void*)norm);
+        return false;
+    }
 
     const int inner  = (int)hp("ssm.inner_size", 0);
     const int dstate = (int)hp("ssm.state_size", 0);
     const int ngrp   = (int)hp("ssm.group_count", 0);
     const int conv   = (int)hp("ssm.conv_kernel", 0);
     const int nv     = (int)hp("ssm.time_step_rank", 0);
-    if (inner <= 0 || dstate <= 0 || nv <= 0) return false;
+    if (inner <= 0 || dstate <= 0 || nv <= 0) {
+        HOOK_DBG("ssm L%d: geometry inner=%d state=%d nv=%d ngrp=%d conv=%d\n",
+                 layer, inner, dstate, nv, ngrp, conv);
+        return false;
+    }
 
     return aero_ssm_forward_q(h, dts, wptrs, wlens, a_log, dt_bias, conv1d, norm,
                               T, n_embd, inner, dstate, ngrp, conv, nv,
                               g_.eps, g_.eps,
                               st.ssm_tail.data(), &st.tail_len, st.ssm_state.data(),
-                              out, (int)g_.threads) == 1;
+                              out, (int)g_.threads) == 0;   // -1 refusal, 0 success
+                       // (attention_layer returns 1 on success -- the two primitives do NOT
+                       // share a convention; each is checked against its own source.)
+}
+
+// ONE ATTENTION LAYER, IN C++. Covers the 8 attention layers of a hybrid qwen35 model
+// (and every layer of a dense one). Geometry is read PER LAYER from the file -- head count,
+// kv head count, head dim, rope dims and rope base all come from the metadata/tensors rather
+// than from one global shape, because gemma4 varies them per layer (256 vs 512 head_dim) and
+// a single global value is exactly the bug that made gemma4 refuse on an SWA layer.
+//
+// kv_phys = pos[0]: the layer writes this step's K/V at that physical index and reads back
+// the retained span [0, kv_phys+T), which is what makes the native decode path work off the
+// state prepared by init_state().
+bool aero::ModelNative::native_attn(int layer, const float* h, const int64_t* pos, int T,
+                                    int n_embd, float* out) {
+    HOOK_DBG("attn L%d: enter (T=%d n_embd=%d)\n", layer, T, n_embd);
+    if (layer < 0 || (size_t)layer >= state_.size()) { HOOK_DBG("attn L%d: layer range\n", layer); return false; }
+    LayerState& st = state_[layer];
+    if (!st.k_slot || !st.v_slot || !pos) { HOOK_DBG("attn L%d: no slot/pos\n", layer); return false; }
+
+    const std::string p = blk(layer);
+    const TensorInfo* qi = r_->find(p + "attn_q.weight");
+    const TensorInfo* ki = r_->find(p + "attn_k.weight");
+    const TensorInfo* vi = r_->find(p + "attn_v.weight");
+    const TensorInfo* oi = r_->find(p + "attn_output.weight");
+    if (!qi || !ki || !vi || !oi) {
+        HOOK_DBG("attn L%d: missing weight q=%p k=%p v=%p o=%p\n", layer,
+                 (const void*)qi, (const void*)ki, (const void*)vi, (const void*)oi);
+        return false;
+    }
+
+    const int64_t n_head = hp("attention.head_count", 0);
+    const int64_t n_kv   = hp("attention.head_count_kv", 0);
+    const int64_t hdim   = hp("attention.key_length", 0);
+    const int64_t vdim   = hp("attention.value_length", hdim);
+    if (n_head <= 0 || n_kv <= 0 || hdim <= 0) {
+        HOOK_DBG("attn L%d: geometry n_head=%lld n_kv=%lld hdim=%lld\n", layer,
+                 (long long)n_head, (long long)n_kv, (long long)hdim);
+        return false;
+    }
+
+    // gemma4's global layers have no attn_v and reuse K -- reported, not assumed
+    const bool v_weightless = false;
+    const int has_gate = (qi->rows() == 2 * n_head * hdim) ? 1 : 0;
+
+    auto fp32 = [&](const char* nm) -> const float* {
+        const TensorInfo* ti = r_->find(p + nm);
+        return ti ? reinterpret_cast<const float*>(r_->tensor_data(*ti)) : nullptr;
+    };
+    const float* q_norm = fp32("attn_q_norm.weight");
+    const float* k_norm = fp32("attn_k_norm.weight");
+
+    // proportional RoPE factors, when the file carries them
+    const float* ff = nullptr;
+    int64_t n_ff = 0;
+    if (const TensorInfo* fi = r_->find("rope_freqs.weight")) {
+        ff = reinterpret_cast<const float*>(r_->tensor_data(*fi));
+        n_ff = fi->n_elements;
+    }
+
+    const int64_t rope_dims = hp("rope.dimension_count", hdim);
+    const float rope_base = (float)r_->get_float(r_->arch() + ".rope.freq_base",
+                                                 r_->get_float("rope.freq_base", 10000.0));
+
+    std::vector<int32_t> qpos((size_t)T);
+    for (int t = 0; t < T; ++t) qpos[(size_t)t] = (int32_t)pos[t];
+
+    const int rc = aero_attention_qwen(h, T, n_embd, qpos.data(),
+                               (int)qi->type, r_->tensor_data(*qi), qi->rows(), has_gate,
+                               (int)ki->type, r_->tensor_data(*ki), ki->rows(),
+                               (int)vi->type, r_->tensor_data(*vi), vi->rows(),
+                               (int)oi->type, r_->tensor_data(*oi), oi->rows(),
+                               q_norm, k_norm, v_weightless ? 1 : 0, g_.eps,
+                               rope_base, rope_dims, ff, n_ff,
+                               n_head, n_kv, hdim, vdim, 0.0f /*scale -> 1/sqrt(d)*/,
+                               0 /*window*/, 1 /*gate: interleaved sigmoid*/, (int)g_.threads,
+                               st.k_slot, st.v_slot, (int64_t)pos[0],
+                               out);
+    HOOK_DBG("attn L%d: primitive rc=%d\n", layer, rc);
+    return rc == 1;
 }
 
 int aero_model_prepare_state(aero_model_t m, int64_t n_ctx) {
@@ -443,9 +537,16 @@ static int ssm_trampoline(void* ctx, int layer, const float* h, int T, int n_emb
     return static_cast<aero::ModelNative*>(ctx)->native_ssm(layer, h, T, n_embd, out) ? 1 : 0;
 }
 
+static int attn_trampoline(void* ctx, int layer, const float* h, const int64_t* pos,
+                           int T, int n_embd, float* out) {
+    return static_cast<aero::ModelNative*>(ctx)->native_attn(layer, h, pos, T, n_embd, out)
+               ? 1 : 0;
+}
+
 int aero_model_use_native_hooks(aero_model_t m) {
     auto* model = static_cast<aero::ModelNative*>(m);
     if (!model) return 0;
+    model->set_attn(attn_trampoline, model);
     model->set_ssm(ssm_trampoline, model);
     return 1;
 }

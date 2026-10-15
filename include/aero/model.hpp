@@ -105,6 +105,8 @@ public:
     // reach them; they return false (never a wrong result) when the file lacks a tensor or
     // the state was not allocated, so the caller can fall back rather than trust garbage.
     bool native_ssm(int layer, const float* h, int T, int n_embd, float* out);
+    bool native_attn(int layer, const float* h, const int64_t* pos, int T,
+                     int n_embd, float* out);
 
     // tokens -> logits for the LAST position (vocab floats). Returns false when
     // a needed primitive is missing or the file lacks a tensor this layout

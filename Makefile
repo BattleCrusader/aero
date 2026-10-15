@@ -206,6 +206,15 @@ $(MLIB): $(MSRC) $(MHDR) $(GSRC) $(GHDR) $(KSRC) $(KHDR) $(TSRC) $(THDR) $(PRIMS
 	$(CXX) -std=c++17 $(CXXFLAGS) -fPIC -shared $(MSRC) $(GSRC) $(KSRC) $(TSRC) $(PRIMSRC) \
 		-o $@ -pthread
 
+# The native hooks, asserted against a KNOWN-CORRECT answer rather than self-consistency:
+# on the raw prompt "The capital of France is" the Python path predicts 11751 ('Paris'), so
+# the C++ hooks must too. Everything it uses is C++ (tokenizer + model + attention + SSM).
+$(BUILD)/test_native_hooks: $(MSRC) $(PRIMSRC) tests/test_native_hooks.cpp $(MHDR) \
+                            src/tokenizer.cpp include/aero/tokenizer.hpp
+	@mkdir -p $(BUILD)
+	$(CXX) -std=c++17 $(CXXFLAGS) $(MSRC) $(PRIMSRC) src/tokenizer.cpp $(GSRC) $(KSRC) $(TSRC) \
+		tests/test_native_hooks.cpp -o $@ -pthread
+
 $(BUILD)/test_model_cpp: $(MSRC) $(PRIMSRC) tests/test_model_cpp.cpp $(MHDR) $(GSRC) $(KSRC) $(TSRC) $(GHDR) $(KHDR) $(THDR)
 	@mkdir -p $(BUILD)
 	$(CXX) -std=c++17 $(CXXFLAGS) $(MSRC) $(PRIMSRC) $(GSRC) $(KSRC) $(TSRC) \
