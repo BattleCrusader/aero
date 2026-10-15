@@ -40,7 +40,9 @@ namespace aero {
 enum class DType : int {
     F32    = 0,
     F16    = 1,
+    Q8_0   = 8,
     Q4_K   = 12,
+    Q5_K   = 13,
     Q6_K   = 14,
     IQ4_XS = 23,
     BF16   = 30,

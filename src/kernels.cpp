@@ -73,6 +73,53 @@ inline void q4k_scales(int j, const uint8_t* q, uint8_t* d, uint8_t* m) {
 }
 
 // One Q4_K super-block dotted against 256 contiguous x values. Never expands w.
+// Q8_0: 34 bytes = f16 d + 32 int8. y = d * q -- no min term, so the dot is
+// d * sum(q*x) and no partial sum of x is needed.
+inline float q8_0_block_dot(const uint8_t* blk, const float* x) {
+    const float d = f16_to_f32(static_cast<uint16_t>(blk[0] | (blk[1] << 8)));
+    const int8_t* q = reinterpret_cast<const int8_t*>(blk + 2);
+    float acc = 0.0f;
+    for (int i = 0; i < 32; ++i) acc += static_cast<float>(q[i]) * x[i];
+    return d * acc;
+}
+
+// Q5_K: 176 bytes = d(2) dmin(2) scales(12) qh(32) qs(128). Same 6-bit scale/min
+// packing as Q4_K (q4k_scales is reused, not re-derived), same low/high nibble split,
+// PLUS a 5th bit per weight taken from qh at bit 2*is for the low half and 2*is+1 for
+// the high half. Verified bit-exact against engine/quant.py's _deq_q5_k.
+inline float q5k_block_dot(const uint8_t* blk, const float* x) {
+    const float d    = f16_to_f32(static_cast<uint16_t>(blk[0] | (blk[1] << 8)));
+    const float dmin = f16_to_f32(static_cast<uint16_t>(blk[2] | (blk[3] << 8)));
+    const uint8_t* scales = blk + 4;
+    const uint8_t* qh     = blk + 16;
+    const uint8_t* qs     = blk + 48;
+
+    float acc = 0.0f;
+    int col = 0, is = 0;
+    for (int j = 0; j < 256; j += 64) {
+        uint8_t s1, m1, s2, m2;
+        q4k_scales(is + 0, scales, &s1, &m1);
+        q4k_scales(is + 1, scales, &s2, &m2);
+        float qx1 = 0.0f, sx1 = 0.0f, qx2 = 0.0f, sx2 = 0.0f;
+        for (int i = 0; i < 32; ++i) {
+            const uint8_t byte = qs[col + i];
+            const float xlo = x[j + i];
+            const float xhi = x[j + 32 + i];
+            const int h1 = (qh[i] >> (2 * is)) & 1;
+            const int h2 = (qh[i] >> (2 * is + 1)) & 1;
+            qx1 += static_cast<float>((byte & 0x0F) | (h1 << 4)) * xlo;
+            sx1 += xlo;
+            qx2 += static_cast<float>((byte >> 4) | (h2 << 4)) * xhi;
+            sx2 += xhi;
+        }
+        acc += (d * static_cast<float>(s1)) * qx1 - (dmin * static_cast<float>(m1)) * sx1;
+        acc += (d * static_cast<float>(s2)) * qx2 - (dmin * static_cast<float>(m2)) * sx2;
+        col += 32;
+        is  += 2;
+    }
+    return acc;
+}
+
 inline float q4k_block_dot(const uint8_t* blk, const float* x) {
     const float d    = f16_to_f32(static_cast<uint16_t>(blk[0] | (blk[1] << 8)));
     const float dmin = f16_to_f32(static_cast<uint16_t>(blk[2] | (blk[3] << 8)));
@@ -196,6 +243,8 @@ inline float block_dot(DType t, const uint8_t* blk, const float* x) {
         case DType::Q4_K: return q4k_block_dot(blk, x);
         case DType::Q6_K: return q6k_block_dot(blk, x);
         case DType::IQ4_XS: return iq4xs_block_dot(blk, x);
+        case DType::Q8_0: return q8_0_block_dot(blk, x);
+        case DType::Q5_K: return q5k_block_dot(blk, x);
         default:          return 0.0f;
     }
 }
@@ -224,7 +273,9 @@ const char* dtype_name(DType t) {
     switch (t) {
         case DType::F32:  return "F32";
         case DType::F16:  return "F16";
+        case DType::Q8_0: return "Q8_0";
         case DType::Q4_K: return "Q4_K";
+        case DType::Q5_K: return "Q5_K";
         case DType::Q6_K: return "Q6_K";
         case DType::IQ4_XS: return "IQ4_XS";
         case DType::BF16: return "BF16";
@@ -237,7 +288,9 @@ int64_t dtype_block_bytes(DType t) {
         case DType::F32:  return 4;
         case DType::F16:  return 2;
         case DType::BF16: return 2;
+        case DType::Q8_0: return 34;
         case DType::Q4_K: return 144;
+        case DType::Q5_K: return 176;
         case DType::Q6_K: return 210;
         case DType::IQ4_XS: return 136;
     }
@@ -249,7 +302,9 @@ int64_t dtype_block_values(DType t) {
         case DType::F32:  return 1;
         case DType::F16:  return 1;
         case DType::BF16: return 1;
+        case DType::Q8_0: return 32;
         case DType::Q4_K: return 256;
+        case DType::Q5_K: return 256;
         case DType::Q6_K: return 256;
         case DType::IQ4_XS: return 256;
     }
@@ -302,6 +357,47 @@ bool dequant_ref(DType t, const uint8_t* raw, int64_t raw_len, float* out,
                     o[j + 32 + i]   = f2 * static_cast<float>(byte >> 4)   - g2;
                 }
                 col += 32; is += 2;
+            }
+        }
+        return true;
+    }
+    if (t == DType::Q8_0) {
+        for (int64_t b = 0; b < nblocks; ++b) {
+            const uint8_t* blk = raw + b * bb;
+            const float d = f16_to_f32(static_cast<uint16_t>(blk[0] | (blk[1] << 8)));
+            const int8_t* q = reinterpret_cast<const int8_t*>(blk + 2);
+            float* o = out + b * 32;
+            for (int i = 0; i < 32; ++i) o[i] = d * static_cast<float>(q[i]);
+        }
+        return true;
+    }
+    if (t == DType::Q5_K) {
+        for (int64_t b = 0; b < nblocks; ++b) {
+            const uint8_t* blk = raw + b * bb;
+            const float d    = f16_to_f32(static_cast<uint16_t>(blk[0] | (blk[1] << 8)));
+            const float dmin = f16_to_f32(static_cast<uint16_t>(blk[2] | (blk[3] << 8)));
+            const uint8_t* scales = blk + 4;
+            const uint8_t* qh = blk + 16;
+            const uint8_t* qs = blk + 48;
+            float* o = out + b * 256;
+            int col = 0, is = 0;
+            for (int j = 0; j < 256; j += 64) {
+                uint8_t s1, m1, s2, m2;
+                q4k_scales(is + 0, scales, &s1, &m1);
+                q4k_scales(is + 1, scales, &s2, &m2);
+                const float f1 = d * static_cast<float>(s1);
+                const float g1 = dmin * static_cast<float>(m1);
+                const float f2 = d * static_cast<float>(s2);
+                const float g2 = dmin * static_cast<float>(m2);
+                for (int i = 0; i < 32; ++i) {
+                    const uint8_t byte = qs[col + i];
+                    const int h1 = (qh[i] >> (2 * is)) & 1;
+                    const int h2 = (qh[i] >> (2 * is + 1)) & 1;
+                    o[j + i]      = f1 * static_cast<float>((byte & 0x0F) | (h1 << 4)) - g1;
+                    o[j + 32 + i] = f2 * static_cast<float>((byte >> 4) | (h2 << 4)) - g2;
+                }
+                col += 32;
+                is  += 2;
             }
         }
         return true;
@@ -400,7 +496,8 @@ bool dequant_threaded(DType t, const uint8_t* raw, int64_t raw_len, float* out,
 // ------------------------------------------------------------------ fusion
 bool matvec(DType dt, const uint8_t* w, const float* x, float* y,
             int64_t n_rows, int64_t n_cols, int threads) {
-    if (dt != DType::Q4_K && dt != DType::Q6_K && dt != DType::IQ4_XS) return false;
+    if (dt != DType::Q4_K && dt != DType::Q6_K && dt != DType::IQ4_XS &&
+        dt != DType::Q8_0 && dt != DType::Q5_K) return false;
     const int64_t bv = dtype_block_values(dt);
     const int64_t bb = dtype_block_bytes(dt);
     if (n_cols % bv != 0) return false;
@@ -419,7 +516,8 @@ bool matvec(DType dt, const uint8_t* w, const float* x, float* y,
 
 bool matmul(DType dt, const uint8_t* w, const float* X, float* Y,
             int64_t n_tokens, int64_t n_rows, int64_t n_cols, int threads) {
-    if (dt != DType::Q4_K && dt != DType::Q6_K && dt != DType::IQ4_XS) return false;
+    if (dt != DType::Q4_K && dt != DType::Q6_K && dt != DType::IQ4_XS &&
+        dt != DType::Q8_0 && dt != DType::Q5_K) return false;
     const int64_t bv = dtype_block_values(dt);
     const int64_t bb = dtype_block_bytes(dt);
     if (n_cols % bv != 0) return false;
@@ -472,7 +570,9 @@ int aero_dequant_ref(int t, const uint8_t* raw, int64_t raw_len, float* out,
     switch (static_cast<aero::DType>(t)) {
         case aero::DType::F32:
         case aero::DType::F16:
+        case aero::DType::Q8_0:
         case aero::DType::Q4_K:
+        case aero::DType::Q5_K:
         case aero::DType::Q6_K:
         case aero::DType::IQ4_XS:
         case aero::DType::BF16:
@@ -489,7 +589,9 @@ int aero_dequant_threaded(int t, const uint8_t* raw, int64_t raw_len, float* out
     switch (static_cast<aero::DType>(t)) {
         case aero::DType::F32:
         case aero::DType::F16:
+        case aero::DType::Q8_0:
         case aero::DType::Q4_K:
+        case aero::DType::Q5_K:
         case aero::DType::Q6_K:
         case aero::DType::IQ4_XS:
         case aero::DType::BF16:

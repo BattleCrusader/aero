@@ -22,13 +22,16 @@ _ROOT = os.path.dirname(_HERE)
 # tensor type ids, mirroring gguf.T_* and the C++ DType enum
 DTYPE_F32 = 0
 DTYPE_F16 = 1
+DTYPE_Q8_0 = 8
 DTYPE_Q4_K = 12
+DTYPE_Q5_K = 13
 DTYPE_Q6_K = 14
 DTYPE_IQ4_XS = 23
 DTYPE_BF16 = 30
 
 # types the native path can compute; anything else must fall back
-NATIVE_TYPES = frozenset({DTYPE_Q4_K, DTYPE_Q6_K, DTYPE_IQ4_XS})
+NATIVE_TYPES = frozenset({DTYPE_Q8_0, DTYPE_Q4_K, DTYPE_Q5_K, DTYPE_Q6_K,
+                          DTYPE_IQ4_XS})
 
 _LIB_CANDIDATES = (
     os.path.join(_ROOT, "build", "libaero_kernels.dylib"),
@@ -135,10 +138,12 @@ def _u8(arr):
 # Values per block, mirrored from the kernel so a thread split lands on block
 # boundaries without a round trip. Kept as a literal dict so this module imports
 # no engine state (it is a leaf binding).
-_BLOCK_VALUES = {DTYPE_F32: 1, DTYPE_F16: 1, DTYPE_Q4_K: 256, DTYPE_Q6_K: 256,
+_BLOCK_VALUES = {DTYPE_F32: 1, DTYPE_F16: 1, DTYPE_Q8_0: 32, DTYPE_Q4_K: 256,
+                 DTYPE_Q5_K: 256, DTYPE_Q6_K: 256,
                  DTYPE_IQ4_XS: 256, DTYPE_BF16: 1}
 
-_BLOCK_BYTES = {DTYPE_F32: 4, DTYPE_F16: 2, DTYPE_Q4_K: 144, DTYPE_Q6_K: 210,
+_BLOCK_BYTES = {DTYPE_F32: 4, DTYPE_F16: 2, DTYPE_Q8_0: 34, DTYPE_Q4_K: 144,
+                DTYPE_Q5_K: 176, DTYPE_Q6_K: 210,
                 DTYPE_IQ4_XS: 136, DTYPE_BF16: 2}
 
 _threads_hint = 0
