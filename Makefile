@@ -20,7 +20,7 @@ PYTESTS := $(wildcard tests/test_*.py)
 .PHONY: all test test-cpp test-engine test-server test-wrappers demo probe test-cached test-cache-status \
         test-cache-clear check-py kernels guard engine-cpp clean
 
-all: $(BUILD)/test_memory_guard $(BUILD)/test_metal_guard $(BUILD)/aero-load-demo $(BUILD)/aero-bwprobe $(BUILD)/test_kernels $(BUILD)/test_tensor $(BUILD)/test_ssm_cpp $(BUILD)/test_gguf $(BUILD)/test_transformer $(KLIB) $(SLIB) $(XLIB) $(TLIB) $(MLIB) $(BUILD)/test_model_cpp
+all: $(BUILD)/test_memory_guard $(BUILD)/test_metal_guard $(BUILD)/aero-load-demo $(BUILD)/aero-bwprobe $(BUILD)/test_kernels $(BUILD)/test_tensor $(BUILD)/test_ssm_cpp $(BUILD)/test_gguf $(BUILD)/test_transformer $(KLIB) $(SLIB) $(XLIB) $(TLIB) $(MLIB) $(KVLIB) $(BUILD)/test_model_cpp
 
 # ---- native kernels ----
 # The test binary links the kernel TU directly, so `make test-cpp` proves the
@@ -50,6 +50,18 @@ $(TLIB): $(TSRC) $(THDR)
 
 tensor-lib: $(TLIB)
 	@echo "native tensor primitives: $(TLIB)"
+
+# ---- native KV cache primitives ----
+KVLIB := $(BUILD)/libaero_kv.dylib
+KVSRC := src/kv.cpp
+KVHDR := include/aero/kv.hpp
+
+$(KVLIB): $(KVSRC) $(KVHDR)
+	@mkdir -p $(BUILD)
+	$(CXX) -std=c++17 $(CXXFLAGS) -fPIC -shared $(KVSRC) -o $@
+
+kv-lib: $(KVLIB)
+	@echo "native kv primitives: $(KVLIB)"
 
 $(BUILD)/test_tensor: $(TSRC) tests/test_tensor.cpp $(THDR)
 	@mkdir -p $(BUILD)
@@ -220,6 +232,7 @@ test-model: check-py
 		$(PY) -W error::RuntimeWarning tests/test_tokenizer.py 2>&1 | tail -30; echo; \
 		$(PY) -W error::RuntimeWarning tests/test_chat_template.py 2>&1 | tail -12; echo; \
 		$(PY) -W error::RuntimeWarning tests/test_pread.py 2>&1 | tail -14; echo; \
+		$(PY) -W error::RuntimeWarning tests/test_kv_native.py 2>&1 | tail -10; echo; \
 		$(PY) -W error::RuntimeWarning tests/test_tensor_native.py 2>&1 | tail -10; echo; \
 		$(PY) -W error::RuntimeWarning tests/test_native_loop.py 2>&1 | tail -8; echo; \
 		$(PY) -W error::RuntimeWarning tests/test_dequant_threads.py 2>&1 | tail -8; echo; \
