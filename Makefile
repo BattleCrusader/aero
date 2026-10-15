@@ -206,9 +206,9 @@ $(MLIB): $(MSRC) $(MHDR) $(GSRC) $(GHDR) $(KSRC) $(KHDR) $(TSRC) $(THDR) $(PRIMS
 	$(CXX) -std=c++17 $(CXXFLAGS) -fPIC -shared $(MSRC) $(GSRC) $(KSRC) $(TSRC) $(PRIMSRC) \
 		-o $@ -pthread
 
-$(BUILD)/test_model_cpp: $(MSRC) tests/test_model_cpp.cpp $(MHDR) $(GSRC) $(KSRC) $(TSRC) $(GHDR) $(KHDR) $(THDR)
+$(BUILD)/test_model_cpp: $(MSRC) $(PRIMSRC) tests/test_model_cpp.cpp $(MHDR) $(GSRC) $(KSRC) $(TSRC) $(GHDR) $(KHDR) $(THDR)
 	@mkdir -p $(BUILD)
-	$(CXX) -std=c++17 $(CXXFLAGS) $(MSRC) $(GSRC) $(KSRC) $(TSRC) \
+	$(CXX) -std=c++17 $(CXXFLAGS) $(MSRC) $(PRIMSRC) $(GSRC) $(KSRC) $(TSRC) \
 		tests/test_model_cpp.cpp -o $@ -pthread
 
 model-cpp: $(BUILD)/test_model_cpp

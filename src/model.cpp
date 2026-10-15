@@ -10,6 +10,7 @@
 
 #include "aero/kernels.hpp"
 #include "aero/tensor.hpp"
+#include "aero/kv.hpp"
 
 namespace aero {
 namespace {
@@ -32,6 +33,58 @@ void norm_row(const float* row, const float* w, float* out, int64_t n, float eps
 
 const char* model_arch_name(int arch) {
     return arch == 0 ? "gemma4" : "qwen35";
+}
+
+// Read an architecture hparam whether or not the file prefixes it with the arch name.
+// The Python side uses an arch-prefixed accessor; the file's keys are prefixed in some
+// revisions and bare in others, and a missing key must read as 0 rather than throw.
+int64_t ModelNative::hp(const std::string& key, int64_t def) const {
+    const std::string full = r_->arch() + "." + key;
+    if (r_->has(full)) return r_->get_int(full, def);
+    if (r_->has(key)) return r_->get_int(key, def);
+    return def;
+}
+
+// Allocate every layer's native state once, sized from the FILE and the context.
+//
+// WHY THIS EXISTS: a native attention hook needs a KV cache and a native SSM hook needs a
+// conv tail plus a recurrent state. While Python drove the layer path it owned both, which
+// is why "the engine is C++" was not yet true. This gives the C++ side somewhere to keep
+// them, so `aero_model_use_native_hooks` has state to work with.
+//
+// Sizing, derived from the file rather than assumed (qwen35: state 128, groups 16,
+// time_step_rank 32, conv kernel 4, inner 4096 -> qkv width 2*16*128 + 4096 = 8192):
+//   attention: KvSlot(cap=context, heads=head_count_kv, dim=key_length, fp32, ring off)
+//   ssm:       tail (kernel-1) x qkv_width, state (time_step_rank, state_size, state_size)
+void ModelNative::init_state(int64_t context) {
+    if (!state_.empty() && kv_state_cap_ >= context) return;   // already sized for this
+    const int64_t n_kv   = hp("attention.head_count_kv", 0);
+    const int64_t head_d = hp("attention.key_length", 0);
+    const int64_t inner  = hp("ssm.inner_size", 0);
+    const int64_t dstate = hp("ssm.state_size", 0);
+    const int64_t ngrp   = hp("ssm.group_count", 0);
+    const int64_t nv     = hp("ssm.time_step_rank", 0);
+    const int64_t conv   = hp("ssm.conv_kernel", 0);
+    const int64_t cap    = context > 0 ? context : 4096;
+
+    state_.assign(layers_.size(), LayerState());
+    const int64_t qkv_width = inner > 0 ? inner + 2 * ngrp * dstate : 0;
+    for (size_t i = 0; i < layers_.size(); ++i) {
+        LayerState& st = state_[i];
+        if (layers_[i].kind == 0 && n_kv > 0 && head_d > 0) {
+            st.kv_cap = cap;
+            st.k_slot = aero_kv_slot_new(cap, n_kv, head_d, 0 /*fp32*/, 0 /*no ring*/);
+            st.v_slot = aero_kv_slot_new(cap, n_kv, head_d, 0, 0);
+            if (!st.k_slot || !st.v_slot)
+                throw std::runtime_error("kv slot allocation failed on layer " +
+                                         std::to_string(i));
+        } else if (layers_[i].kind == 1 && qkv_width > 0 && dstate > 0 && nv > 0) {
+            st.ssm_tail.assign((size_t)((conv > 1 ? conv - 1 : 0) * qkv_width), 0.0f);
+            st.ssm_state.assign((size_t)(nv * dstate * dstate), 0.0f);
+            st.tail_len = 0;
+        }
+    }
+    kv_state_cap_ = cap;
 }
 
 ModelNative::ModelNative(const std::string& path, const Geom& g,
@@ -318,6 +371,21 @@ int aero_model_forward(aero_model_t m, const int32_t* tokens, int n_tokens,
                        const int64_t* positions, float* logits) {
     if (!m) return 0;
     return ((aero::ModelNative*)m)->forward(tokens, n_tokens, positions, logits) ? 1 : 0;
+}
+
+// Allocate the per-layer native state (KV slots, SSM tail + recurrence) for `n_ctx`.
+// Exposed rather than automatic: the Python path must keep working unchanged while the
+// native hooks are built, and an unrequested 268 MB of KV slots at n_ctx=4096 across 8
+// attention layers is not something to allocate behind a caller's back.
+int aero_model_prepare_state(aero_model_t m, int64_t n_ctx) {
+    auto* model = static_cast<aero::ModelNative*>(m);
+    if (!model) return 0;
+    try {
+        model->init_state(n_ctx);
+        return 1;
+    } catch (...) {
+        return 0;                       // allocation refused; caller reports, never guesses
+    }
 }
 
 int aero_model_n_layer(aero_model_t m) {

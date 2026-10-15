@@ -154,3 +154,16 @@ inline void kv_slot_read(const KvSlot& sl, int64_t phys, int64_t head, float* ou
 }
 
 }  // namespace aero
+
+// ---------------------------------------------------------------------- C ABI
+// The KvSlot allocator, declared here so C++ callers can use it too. kv.cpp owns the
+// definitions; until now only ctypes could reach them, which is why the native model had
+// no way to keep a KV cache of its own.
+extern "C" {
+void*   aero_kv_slot_new(int64_t cap, int64_t heads, int64_t dim, int dtype, int ring);
+void    aero_kv_slot_free(void* s);
+int64_t aero_kv_slot_bytes(void* s);
+int     aero_kv_slot_write(void* s, int64_t phys, int64_t head, const float* x);
+int     aero_kv_slot_read(void* s, int64_t phys, int64_t head, float* out);
+}
+

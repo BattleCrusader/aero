@@ -96,6 +96,11 @@ public:
     void set_ssm(SsmFn fn, void* ctx) { ssm_ = fn; ssm_ctx_ = ctx; }
     void set_moe(MoeFn fn, void* ctx) { moe_ = fn; moe_ctx_ = ctx; }
 
+    // Allocate the per-layer native state (KV slots for attention layers, conv tail and
+    // recurrence for SSM layers), sized from the file and `context`. Idempotent: a second
+    // call with a context the existing allocation already covers does nothing.
+    void init_state(int64_t context);
+
     // tokens -> logits for the LAST position (vocab floats). Returns false when
     // a needed primitive is missing or the file lacks a tensor this layout
     // requires, so the caller can fall back to another path.
@@ -110,6 +115,26 @@ private:
     bool qwen_block(int layer, int T);
     bool ffn(int layer, int T, const float* h2, float* out);
     bool mm(const std::string& name, const float* X, float* Y, int64_t T);
+
+    // ---- PER-LAYER NATIVE STATE -----------------------------------------------
+    // A C++ hook cannot run a layer without somewhere to keep its state, and until
+    // now that somewhere was Python (the interpreter owned the KV cache and the SSM
+    // recurrence). Allocation is lazy -- `init_state` runs from forward() once the
+    // context is known -- so nothing here changes behaviour until a native hook is
+    // installed.
+    //   attention (kind 0): one KvSlot per side, from kv.cpp's own allocator
+    //   ssm       (kind 1): a conv tail of (kernel-1) rows and the (nv, d, d) state
+    struct LayerState {
+        void* k_slot = nullptr;
+        void* v_slot = nullptr;
+        int64_t kv_cap = 0;
+        std::vector<float> ssm_tail;      // (conv_kernel-1) x qkv_width
+        std::vector<float> ssm_state;     // n_v_heads x d_state x d_state
+        int tail_len = 0;
+    };
+    std::vector<LayerState> state_;
+    int64_t kv_state_cap_ = 0;
+    int64_t hp(const std::string& key, int64_t def = 0) const;
 
     std::unique_ptr<GgufReader> r_;
     Geom g_;
@@ -173,6 +198,7 @@ void aero_model_set_moe(aero_model_t m, aero_moe_fn fn, void* ctx);
 int aero_model_forward(aero_model_t m, const int32_t* tokens, int n_tokens,
                        const int64_t* positions, float* logits);
 
+int aero_model_prepare_state(aero_model_t m, int64_t n_ctx);
 int aero_model_n_layer(aero_model_t m);
 int aero_model_n_embd(aero_model_t m);
 int aero_model_vocab(aero_model_t m);
